@@ -4,6 +4,8 @@
 
 TODO:
 - test
+- apply encryption in sending-receiving functions
+- use SHA256 in the end of chall enc again
 
 TO-CHECK:
 - compile with ASAN to detect memory corruption issues
@@ -1539,7 +1541,7 @@ char *get_challenge_solution(char *challenge, size_t size, size_t *out_size, cha
         
     *out_size = 0;
     
-    ptr = encrypt_data(challenge, size, key, key_sz, &out_size_x);
+    ptr = encrypt_challenge(challenge, size, key, key_sz, &out_size_x);
     if(!ptr)
         return NULL;
         
