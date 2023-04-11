@@ -344,8 +344,10 @@ ssize_t http_write_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int i
 
 ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is_https) {
   int bytes_available = 0;
+  int bavailable_x = 0;
   size_t sent = 0;
   int r = 0;
+  int rx = 0;
   char *ptr = NULL;
   BIO *s_rbio = NULL;
   int s_fd = -1;
@@ -359,13 +361,19 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
 
   sock_m = sock;
 
-  // TODO: check if FIONREAD on BIO obtained fd is good
   if(is_https) {
+    /*
     s_rbio = SSL_get_rbio(c_ssl);
     if(BIO_get_fd(s_rbio, &sock_m) < 0)
       return -1;
+    */
+    sock_m = SSL_get_fd(c_ssl);
+    if(sock_m < 0)
+      return -1;
+  } else {
+    sock_m = sock;
   }
-
+  
   #if WINDOWS_OS
   r = ioctlsocket(sock_m, FIONREAD, &bytes_available);
   #else
@@ -384,18 +392,31 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
   if(!ptr)
     return -1;
 
+  sent = 0;
   while(sent < bytes_available) {
     if(is_https)
       r = SSL_read(c_ssl, ptr, bytes_available - sent);
     else
-      r = read(sock_m, ptr, bytes_available - sent);
+      r = read(sock, ptr, bytes_available - sent);
     if(r < 0)
       return -1;
-    sent += r;
+      
+   sent += r;
+      
+  #if WINDOWS_OS
+  rx = ioctlsocket(sock_m, FIONREAD, &bavailable_x);
+  #else
+  rx = ioctl(sock_m, FIONREAD, &bavailable_x);
+  #endif
+  if(rx < 0)
+    return -1;
+    
+   if(bavailable_x <= 0)
+     break;
   }
 
   *data = ptr;
-  *data_sz = bytes_available;
+  *data_sz = sent;
 
   return sent;
 }
