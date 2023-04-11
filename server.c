@@ -30,6 +30,20 @@ TODO:
 #include <time.h>
 #include <sys/select.h>
 #include <sys/types.h>
+#include <ctype.h>
+#include <sys/poll.h>
+#include <sys/ioctl.h>
+
+#include <openssl/bio.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
+
+#include <openssl/aes.h>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
 
 #include "tp/base64.h"
 
@@ -60,8 +74,15 @@ TODO:
 #define MIN_CHANNEL_ID 0x0000111111111111
 #define MAX_CHANNEL_ID 0x0000ffffffffffff
 
+#define AES_IV_SIZE 16
+
+#define MIN_IV_CHAR_RANGE 0x1
+#define MAX_IV_CHAR_RANGE 0xff
+
 #define MIN_CHALL_CHR_VAL 0x01
 #define MAX_CHALL_CHR_VAL 0xff
+
+#define MAX_KEY_SIZE 64
 
 typedef enum {
   HTTPS_COM_PROTO = 0,
@@ -89,6 +110,8 @@ typedef struct _http_handshake_def {
   char *challenge;
   char *solution;
   int is_solved;
+  int fail;
+  size_t sol_size;
 } http_handshake_def;
 
 typedef struct _conn_def {
@@ -101,13 +124,16 @@ typedef struct _conn_def {
   channel_def *c_channels;
 } conn_def;
 
-typedef struct _buffer_queue {
+typedef struct buffer_queue buffer_queue;
+
+typedef struct buffer_queue {
+  int queue_id;
   int client_id;
   size_t size;
   time_t queue_time;
   buffer_queue *next;
   char data[0];
-} buffer_queue;
+};
 
 typedef struct _proxy_client_def {
   int proxy_client_id;
@@ -233,6 +259,9 @@ http_handshake_def *handshake_defs = NULL;
 char *_key = NULL;
 size_t _key_sz = 0;
 proto_t _proto = 0;
+char *_cert_file = NULL;
+
+SSL_CTX *_ctx = NULL;
 
 void ping_worker(void) {
   long curr_time = 0;
@@ -259,6 +288,23 @@ void shutdown_srv(void) {
   return;
 }
 
+int file_exists(const char *path) {
+    FILE *file = NULL;
+    
+    if(!path)
+      return 0;
+      
+    if((file = fopen(path, "r")) != NULL) {
+        if(file) {
+          fclose(file);
+          file = NULL;
+        }
+        return 1;
+    }
+    
+    return 0;
+}
+
 uint64_t generate_client_id(void) {
     uint64_t client_id = (rand() % (MAX_CLIENT_ID - MIN_CLIENT_ID + 1)) + MIN_CLIENT_ID;
     return client_id;
@@ -267,22 +313,6 @@ uint64_t generate_client_id(void) {
 uint64_t generate_channel_id(void) {
     uint64_t channel_id = (rand() % (MAX_CHANNEL_ID - MIN_CHANNEL_ID + 1)) + MIN_CHANNEL_ID;
     return channel_id;
-}
-
-char *generate_random_challenge(void) {
-   char *chall = NULL;
-   unsigned char c = 0;
-   
-   chall = calloc(CHALLENGE_DEFAULT_SIZE + 1, sizeof(char));
-   if(!chall)
-       return NULL;
-       
-   for(int i = 0 ; i < CHALLENGE_DEFAULT_SIZE ; i++) {
-       c = (rand() % (0xff - 0x01 + 1)) + 0x01;
-       chall[i] = c;
-   }
-   
-   return chall;
 }
 
 int handshake_sess_exists(int h_id) {
@@ -332,6 +362,32 @@ int is_challenge_solved(int h_id) {
    return 1;
 }
 
+int is_challenge_failure(int h_id) {
+   int idx = -1;
+   int r = 0;
+   // XXX: add locking
+   
+   if(h_id < 0)
+     return 0;
+     
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      if(handshake_defs[i].h_id == h_id) {
+        idx = i;
+        break;
+      }
+   }
+   
+   if(idx == -1) {
+      return 0;
+   }
+   
+   r = handshake_defs[idx].fail;
+   if(r == 0)
+     return 0;
+     
+   return 1;
+}
+
 int mark_challenge_solved(int h_id) {
    int idx = -1;
    // XXX: add locking
@@ -355,9 +411,32 @@ int mark_challenge_solved(int h_id) {
    return 1;
 }
 
+int mark_challenge_failure(int h_id) {
+   int idx = -1;
+   // XXX: add locking
+   
+   if(h_id < 0)
+     return 0;
+     
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      if(handshake_defs[i].h_id == h_id) {
+        idx = i;
+        break;
+      }
+   }
+   
+   if(idx == -1) {
+      return 0;
+   }
+   
+   handshake_defs[idx].fail = 1;
+     
+   return 1;
+}
+
 int create_handshake(int h_id) {
    int idx = -1;
-   char *chall = NULL;
+   char chall[CHALLENGE_DEFAULT_SIZE + 1] = { 0 };
    char *sol_a = NULL;
    char *sol = NULL;
    size_t sol_size_a = 0;
@@ -378,26 +457,15 @@ int create_handshake(int h_id) {
       return 0;
    }
    
-   chall = generate_random_challenge();
-   if(!chall) {
-      return 0;
-   }
+   generate_random_challenge(chall, CHALLENGE_DEFAULT_SIZE);
    
    sol_a = encrypt_challenge(chall, CHALLENGE_DEFAULT_SIZE, _key, _key_sz, &sol_size_a);
    if(!sol_a) {
-      if(chall) {
-        free(chall);
-        chall = NULL;
-      }
       return 0;
    }
    
     sol = sha256_hash(sol_a, sol_size_a, &sol_size);
     if(!sol) {
-        if(chall) {
-          free(chall);
-          chall = NULL;
-        }
 
         if(sol_a) {
           free(sol_a);
@@ -412,10 +480,11 @@ int create_handshake(int h_id) {
    }
    
    handshake_defs[idx].h_id = h_id;
-   handshake_defs[idx].challenge = chall;
+   handshake_defs[idx].challenge = memdup(chall, CHALLENGE_DEFAULT_SIZE);
    handshake_defs[idx].solution = sol;
    handshake_defs[idx].sol_size = sol_size;
    handshake_defs[idx].is_solved = 0;
+   handshake_defs[idx].fail = 0;
    
    return 1;
 }
@@ -440,6 +509,7 @@ int delete_handshake(int h_id) {
    
    handshake_defs[idx].h_id = 0;
    handshake_defs[idx].is_solved = 0;
+   handshake_defs[idx].fail = 0;
    
    if(handshake_defs[idx].challenge) {
       free(handshake_defs[idx].challenge);
@@ -509,7 +579,7 @@ char *get_h_challenge_solution(int h_id, size_t *out_size) {
    return sol;
 }
 
-void *memdup(const void *mem, size_t size) { 
+void *memdup(void *mem, size_t size) { 
    void *out = calloc(size, sizeof(char));
    if(out != NULL)
        memcpy(out, mem, size);
@@ -894,7 +964,7 @@ int channel_id_exists(int channel_id) {
   if(channel_id <= 0)
     return 0;
 
-  for(int i = 0 ; i < MAX_CONCURRENT_CHANNELS ; i++) {
+  for(int i = 0 ; i < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; i++) {
     if(client_conns[i].c_channels) {
       if(cl_channel_id_exists(channel_id, i)) {
         idx = i;
@@ -908,7 +978,9 @@ int channel_id_exists(int channel_id) {
   return 1;
 }
 
+#if 0
 int create_channel() {
+  int channel_id = 0;
   //...
   while(1) {
     channel_id = generate_channel_id();
@@ -920,6 +992,72 @@ int create_channel() {
   
   return channel_id;
 }
+#endif
+
+// +++++++++++++++++++++= funcs =++++++++++++++++++++++++++++++++++
+
+int create_channel(int client_id, int proxy_sock, char *host, int port) {
+
+}
+
+int close_channel(int channel_id) {
+  // TODO: also close the srv proxy side too
+}
+
+int channel_exists(int channel_id) {
+
+}
+
+/* XXX: sock = -1 if HTTP(S) */
+int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
+
+}
+
+int close_client(int client_id) {
+  // TODO: also close every channel iteratively, closing the srv proxy side too
+}
+
+int client_exists(int client_id) {
+
+}
+
+int get_client_by_channel_id(int channel_id) {
+
+}
+
+int get_proxy_sock_by_channel_id(int channel_id) {
+
+}
+
+int is_channel_by_client(int client_id, int channel_id) {
+
+}
+
+// TODO: if HTTP(S) queue data using queue_data, else use get_relay_sock_by_client_id()
+
+int get_relay_sock_by_client_id(int client_id) {
+
+}
+
+int queue_data(int client_id, char *data, size_t data_sz, time_t timestamp) {
+
+}
+
+int remove_queued_data(int queue_id) {
+
+}
+
+char *get_queued_data(int queue_id, size_t *out_size) {
+
+}
+
+char *get_next_queued_data(int client_id, size_t *out_size) {
+    // TODO: unlink + call remove_queued_data
+}
+
+// TODO: prepare design and functions for route discovery process
+
+// +++++++++++++++++++++= funcs =++++++++++++++++++++++++++++++++++
 
 int parse_socks_hdr(char *data, size_t data_sz, char **host, int **port) {
   socks_hdr *s_hdr = NULL;
@@ -958,7 +1096,7 @@ void collect_dead_clients_worker(void) {
   return;
 }
 
-int send_remote_cmd(int sock, scmt_t cmd, int channel_id) {
+int send_remote_cmd(int sock, scmd_t cmd, int channel_id) {
   // TODO
   return 1;
 }
@@ -1046,7 +1184,7 @@ int handshake(int sock) {
        
     generate_random_challenge(chall, CHALLENGE_DEFAULT_SIZE);
         
-    p = get_challenge_solution(chall, CHALLENGE_DEFAULT_SIZE, &out_size, key, key_sz);
+    p = get_challenge_solution(chall, CHALLENGE_DEFAULT_SIZE, &out_size, _key, _key_sz);
     if(!p || out_size == 0) {
        err = 1;
        goto end;
@@ -1111,6 +1249,7 @@ end:
 
 int relay_tcp_srv_poll(int sock) {
   int err = 0;
+  int r = 0;
   int cid = 0;
   int res = 0;
   struct pollfd fds[1] = { -1 };
@@ -1141,7 +1280,7 @@ int relay_tcp_srv_poll(int sock) {
         continue;
      } else {
         if(fds[0].revents & POLLIN) {
-            r = read(sockfd, tmp_buffer, RELAY_BUFFER_SIZE);
+            r = read(sock, tmp_buffer, RELAY_BUFFER_SIZE);
             if(r < 0) {
                // TODO: mark client and its channels as close (plus close proxy srv side of each fucked channel)
                err = 1;
@@ -1161,11 +1300,16 @@ int relay_tcp_srv_poll(int sock) {
         }
         
         sleep(1);
+     } 
   }
   
   err = 0;
 end:
-  // TODO: close sock here if not already
+  // TODO: mark client_id as closed
+  if(sock != -1) {
+    close(sock);
+    sock = -1;
+  }
   return 1;
 }
 
@@ -1198,8 +1342,10 @@ ssize_t http_write_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int i
 
 ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is_https) {
   int bytes_available = 0;
+  int bavailable_x = 0;
   size_t sent = 0;
   int r = 0;
+  int rx = 0;
   char *ptr = NULL;
   BIO *s_rbio = NULL;
   int s_fd = -1;
@@ -1213,13 +1359,19 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
 
   sock_m = sock;
 
-  // TODO: check if FIONREAD on BIO obtained fd is good
   if(is_https) {
+    /*
     s_rbio = SSL_get_rbio(c_ssl);
     if(BIO_get_fd(s_rbio, &sock_m) < 0)
       return -1;
+    */
+    sock_m = SSL_get_fd(c_ssl);
+    if(sock_m < 0)
+      return -1;
+  } else {
+    sock_m = sock;
   }
-
+  
   #if WINDOWS_OS
   r = ioctlsocket(sock_m, FIONREAD, &bytes_available);
   #else
@@ -1238,113 +1390,194 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
   if(!ptr)
     return -1;
 
+  sent = 0;
   while(sent < bytes_available) {
     if(is_https)
       r = SSL_read(c_ssl, ptr, bytes_available - sent);
     else
-      r = read(sock_m, ptr, bytes_available - sent);
+      r = read(sock, ptr, bytes_available - sent);
     if(r < 0)
       return -1;
-    sent += r;
+      
+   sent += r;
+      
+  #if WINDOWS_OS
+  rx = ioctlsocket(sock_m, FIONREAD, &bavailable_x);
+  #else
+  rx = ioctl(sock_m, FIONREAD, &bavailable_x);
+  #endif
+  if(rx < 0)
+    return -1;
+    
+   if(bavailable_x <= 0)
+     break;
   }
 
   *data = ptr;
-  *data_sz = bytes_available;
+  *data_sz = sent;
 
   return sent;
 }
 
-/*
-int open_http_conn(char *host, int port, int is_https, SSL **c_ssl) {
-  SSL_CTX *ctx = NULL;
-  SSL *ssl = NULL;
-  X509 *cert = NULL;
-  X509_NAME *cert_name = NULL;
-  int sock = 0;
-  struct sockaddr_in srvaddr, cli;
-
-  if(!host || port == 0 || !c_ssl)
-    return -1;
-
-  *c_ssl = NULL;
-
-  if(is_https) {
-    if(SSL_library_init() < 0)
-      return -1;
-
-    if((ctx = SSL_CTX_new(TLS_client_method())) == NULL)
-      return -1;
-
-    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2);
-
-    ssl = SSL_new(ctx);
-    if(ssl == NULL)
-      return -1;
-  }
-
-  sock = socket(AF_INET, SOCK_STREAM, 0);
-  if(sock < 0)
-    return -1;
-
-  bzero(&srvaddr, sizeof(srvaddr));
-
-  srvaddr.sin_family = AF_INET;
-  srvaddr.sin_addr.s_addr = inet_addr(host);
-  srvaddr.sin_port = htons(port);
-
-  if(connect(sock, (struct sockaddr *)&srvaddr, sizeof(srvaddr)) != 0) {
-    if(sock != -1)
-      close(sock);
-    return -1;
-  }
-
-  if(is_https) {
-    SSL_set_fd(ssl, sock);
-
-    if(SSL_connect(ssl) != 1)
-      return -1;
-
-    cert = SSL_get_peer_certificate(ssl);
-    if(cert == NULL)
-      return -1;
-
-    cert_name = X509_NAME_new();
-    cert_name = X509_get_subject_name(cert);
-
-    _ssl = ssl;
-    _ctx = ctx;
-    _cert = cert;
-
-    *c_ssl = ssl;
-  }
-
-  return sock;
+int get_get_param(char *data, size_t data_sz, int is_handshake) {
+	char *p = NULL;
+	char *keyword = NULL;
+	char *p2 = NULL;
+	char *p3 = NULL;
+	int found = 0;
+	int param = 0;
+	
+	if(!data || data_sz == 0 || is_handshake < 0)
+	  return -1;
+	
+	if(is_handshake)
+		keyword = "?h=";
+	else
+		keyword = "?cid=";
+	
+	p = memdup(data, data_sz);
+	if(!p) {
+		return -1;
+	}
+           
+	p2 = strstr(p, keyword);
+	if(!p2) {
+	       if(p) {
+	          free(p);
+	          p = NULL;
+	       }
+		return -1;
+	}
+           p3 = p2 + strlen(keyword);
+           
+           found = 0;
+           for(int i = 0 ; i < strlen(p3) ; i++) {
+              if(p3[i] == ' ') {
+                 p3[i] = '\0';
+                 found = 1;
+                 break;
+              } 
+           }
+           
+           if(!found) {
+	       if(p) {
+	          free(p);
+	          p = NULL;
+	       }
+		return -1;
+           }
+           
+           param = atoi(p3);
+           if(param <= 0) {
+	       if(p) {
+	          free(p);
+	          p = NULL;
+	       }
+		return -1;
+           }
+           
+	       if(p) {
+	          free(p);
+	          p = NULL;
+	       }
+           
+           return param;
 }
 
-void http_close(int sock, SSL *c_ssl, int is_https) {
-  if(is_https) {
-    if(c_ssl) {
-      SSL_free(c_ssl);
-      c_ssl = NULL;
-    }
-
-    if(_cert) {
-      X509_free(_cert);
-      _cert = NULL;
-    }
-
-    if(_ctx) {
-      SSL_CTX_free(_ctx);
-      _ctx = NULL;
-    }
+char *get_data_from_http(char *data, size_t data_sz, size_t *out_size) {
+   char *p = NULL;
+   char *p2 = NULL;
+   char *p3 = NULL;
+   char *raw = NULL;
+   size_t raw_sz = 0;
+   
+   if(!data || data_sz == 0 || !out_size)
+     return NULL;
+     
+    *out_size = 0;
+    
+	p = memdup(data, data_sz);
+	if(!p) {
+		return -1;
+	}
+    
+   p2 = strstr(p, DATA_INPUT_PREFIX);
+   if(!p2) {
+      if(p) {
+         free(p);
+         p = NULL;
+      }
+      return NULL;
+   }
+   p2 += sizeof(DATA_INPUT_PREFIX);
+   
+   p3 = strstr(p2, DATA_INPUT_SUFFIX);
+   if(!p3) {
+      if(p) {
+         free(p);
+         p = NULL;
+      }
+      return NULL;
+   }
+   
+   *p3 = 0;
+ 
+  raw = base64_decode(p2, strlen(p2), &raw_sz);
+  if(raw) {
+      if(p) {
+         free(p);
+         p = NULL;
+      }
+      return NULL;
   }
+  
+  if(p) {
+    free(p);
+    p = NULL;
+  }
+  
+  *out_size = raw_sz;
 
-  if(sock != -1)
-    close(sock);
-
-  return;
+  return raw;
 }
-*/
+
+char *get_http_data_response(char *data, size_t data_sz, size_t *out_size) {
+  char *out = NULL;
+  size_t osz = 0;
+  char *b64_p = NULL;
+  size_t b64_sz = 0;
+  
+  if(!data || data_sz == 0 || !out_size)
+    return NULL;
+    
+  *out_size = 0;
+  
+  b64_p = base64_decode(data, data_sz, &b64_sz);
+  if(!b64_p || b64_sz == 0) {
+     *out_size = 0;
+     return NULL;
+  }
+  
+  asprintf(&out, "HTTP/1.1 200 OK\r\n"
+             "Cache-Control: private, max-age=0\r\n"
+             "Content-Type: text/html; charset=ISO-8859-1\r\n"
+             "X-XSS-Protection: 0\r\n"
+             "X-Frame-Options: SAMEORIGIN\r\n"
+	     "Transfer-Encoding: chunked\r\n"
+	     "Set-Cookie: session=jnd82Nsb2VFDJdn25sAlF6sdD47wv\r\n"
+	     "Content-Length: %ld\r\n"
+	     "\r\n<!DOCTYPE html><html><head><title>image</title></head><body>%s%s%s</body></html>",
+	      strlen(DATA_PREFIX) + strlen(b64_p) + strlen(DATA_SUFFIX) + 74, DATA_PREFIX, b64_p, DATA_SUFFIX);
+  osz = strlen(out);
+  
+  if(b64_p) {
+     free(b64_p);
+     b64_p = NULL;
+  }
+    
+   *out_size = osz;
+   return out;
+}
 
 /*
   UNKNOWN_REQUEST_TYPE = 0,
@@ -1354,22 +1587,20 @@ void http_close(int sock, SSL *c_ssl, int is_https) {
 */
 
 char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
-   char *p = NULL;
    char *p1 = NULL;
    char *p2 = NULL;
    char *p3 = NULL;
-   char *bk = NULL;
    char *chall = NULL;
    char *real_sol = NULL;
    size_t real_sol_sz = 0;
-   int found = 0;
    int cid = 0;
    int h_id = 0;
    int err = 0;
    char *out = NULL;
    size_t osz = 0;
-   char *raw = NULL'
+   char *raw = NULL;
    size_t raw_sz = 0;
+   int param = 0;
    req_t req_type = UNKNOWN_REQUEST_TYPE;
    
    if(!data || data_sz == 0 || !out_size)
@@ -1380,7 +1611,6 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
    p1 = strstr(data, "?h=");
    if(p1) {
          req_type = HANDSHAKE_SESSION_TYPE;
-      }
    } else if (p2 = strstr(data, "?cid=")) {
       if(p3 = strstr(data, "Content-Length: 0\r\n")) {
         req_type = DATA_REQUEST_TYPE;
@@ -1400,83 +1630,20 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
       return NULL;
    }
    
-   p = memdup(data, data_sz);
-   if(!p) {
+   param = get_get_param(data, data_sz, (req_type == HANDSHAKE_SESSION_TYPE) ? 1 : 0);
+   if(param <= 0) {
      *out_size = 0;
-     return NULL;
+     goto end;
    }
    
    if(req_type == DATA_SENDING_TYPE ||
       req_type == DATA_REQUEST_TYPE) {
-           bk = p2 = memdup(data, data_sz);
-           if(!p2) {
-              puts("fail 0");
-              err = 1;
-              goto end;
-           }
-           
-           p2 = strstr(p, "?cid=");
-           if(!p2) {
-              puts("fail 1");
-              err = 1;
-              goto end;
-           }
-           p3 = p2 + strlen("?cid=");
-           
-           found = 0;
-           for(int i = 0 ; i < strlen(p3) ; i++) {
-              if(p3[i] == ' ') {
-                 p3[i] = '\0';
-                 found = 1;
-                 break;
-              } 
-           }
-           
-           if(!found) {
-              puts("fail 2");
-              err = 1;
-              goto end;
-           }
-           
-           cid = atoi(p3);
-           if(cid <= 0) {
-              puts("fail 3");
-              err = 1;
-              goto end;
-           }
-           
-           if(/* TODO: check if cid is NOT defined in global structs */) {
-              puts("fail 4");
-              err = 1;
-              goto end;
-           }
 
-           if(bk) {
-              free(bk);
-              bk = NULL;
-           }
-              
-           p2 = NULL;
-           p3 = NULL;
+           cid = param;
            
            if(req_type == DATA_SENDING_TYPE) {
-		   p2 = strstr(p, DATA_INPUT_PREFIX);
-		   if(!p2) {
-                      err = 1;
-                      goto end;
-		   }
-		   p2 += sizeof(DATA_INPUT_PREFIX);
-		   
-		   p3 = strstr(p2, DATA_INPUT_SUFFIX);
-		   if(!p3) {
-                      err = 1;
-                      goto end;
-		   }
-		   
-		   *p3 = 0;
-		 
-		  raw = base64_decode(p2, strlen(p2), &raw_sz);
-		  if(raw) {
+		  raw = get_data_from_http(data, data_sz, &raw_sz);
+		  if(raw || raw_sz == 0) {
 		      err = 1;
 		      goto end;
 		  }
@@ -1491,86 +1658,42 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
 		   raw = NULL;
 		 }
 		 
-		 if(p) {
-		    free(p);
-		    p = NULL;
-		 }
-		 
 		 *out_size = 0;
 		 return NULL;
 	   } else if(req_type == DATA_REQUEST_TYPE) {
 	   	   // TODO: [...]
 	   	   //   check if we are in the process of route discovery, if so prorize it over queued buffers
 	   	   //   if no discovery process currently, grab next queued buffer with that cid and return it
+	   	   // TODO: get_http_data_response
 	   }
    } else if(req_type == HANDSHAKE_SESSION_TYPE) {
-           bk = p2 = memdup(data, data_sz);
-           if(!p2) {
-              puts("fail 0x");
-              err = 1;
-              goto end;
-           }
-           
-           p2 = strstr(p, "?h=");
-           if(!p2) {
-              puts("fail 1x");
-              err = 1;
-              goto end;
-           }
-           p3 = p2 + strlen("?h=");
-           
-           found = 0;
-           for(int i = 0 ; i < strlen(p3) ; i++) {
-              if(p3[i] == ' ') {
-                 p3[i] = '\0';
-                 found = 1;
-                 break;
-              } 
-           }
-           
-           if(!found) {
-              puts("fail 2x");
-              err = 1;
-              goto end;
-           }
-           
-           h_id = atoi(p3);
-           if(h_id < 0) {
-              puts("fail 3x");
-              err = 1;
-              goto end;
-           }
 
-           if(bk) {
-              free(bk);
-              bk = NULL;
-           }
-              
-           p2 = NULL;
-           p3 = NULL;
+         h_id = param;
          
          if(handshake_sess_exists(h_id)) {
-            if(is_challenge_solved(h_id)) {
+            if(is_challenge_solved(h_id) || is_challenge_failure(h_id)) {
+            
+               if(is_challenge_solved(h_id)) {
                // TODO: create a new client in structures
-               // TODO: return uint32_t as cid to client and HTTP data with b64 blabla to caller
+               // TODO: initialize 'cid' to new client id
+               } else if (is_challenge_failure(h_id)) {
+                 cid = 0;
+               } else {
+                 err = 1;
+                 goto end;
+               }
+        
+               out = get_http_data_response(&cid, sizeof(uint32_t), &osz);
+               if(!out || osz == 0) {
+                 err = 1;
+                 goto end;
+               }
+               
+               err = 0;
+               goto end;
             } else {
-		   p2 = strstr(p, DATA_INPUT_PREFIX);
-		   if(!p2) {
-                      err = 1;
-                      goto end;
-		   }
-		   p2 += sizeof(DATA_INPUT_PREFIX);
-		   
-		   p3 = strstr(p2, DATA_INPUT_SUFFIX);
-		   if(!p3) {
-                      err = 1;
-                      goto end;
-		   }
-		   
-		   *p3 = 0;
-		  
-		  raw = base64_decode(p2, strlen(p2), &raw_sz);
-		  if(raw) {
+		  raw = get_data_from_http(data, data_sz, &raw_sz);
+		  if(raw || raw_sz == 0) {
 		      err = 1;
 		      goto end;
 		  }
@@ -1589,17 +1712,16 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
 		       }
 		   } else {
 		      puts("wronng sol");
+		       if(!mark_challenge_failure(h_id)) {
+		          err = 1;
+		          goto end;
+		       }
 		   }
-               
-		 if(bk) {
-		     free(bk);
-		     bk = NULL;
-		   }
-		   
-		   if(p) {
-		      free(p);
-		      p = NULL;
-		   }
+
+		 if(raw) {
+		   free(raw);
+		   raw = NULL;
+		 }
                
                *out_size = 0;
                return NULL;
@@ -1616,29 +1738,19 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
                goto end;
              }
              
-             // TODO: incapsulate into HTTP data and blabla base64 and return it to client
+             out = get_http_data_response(chall, CHALLENGE_DEFAULT_SIZE, &osz);
+             if(!out || osz == 0) {
+               err = 1;
+               goto end;
+             }
+             
+             err = 0;
+             goto end;
          }
    }
-   
-  if(p) {
-    free(p);
-    p = NULL;
-  }
-   
-   // TODO: remember to return the actual HTTP data with headers, base64 encoded etc to caller (not actual binary data)!!!!!!!!!!!!!!!!!111+1
       
   err = 0;
 end:
-   if(bk) {
-     free(bk);
-     bk = NULL;
-   }
-   
-   if(p) {
-      free(p);
-      p = NULL;
-   }
-
    if(raw) {
       free(raw);
       raw = NULL;
@@ -1703,7 +1815,7 @@ int relay_http_srv_handle_req(rl_arg_pass *arg) {
                      "X-Frame-Options: SAMEORIGIN\r\n"
       		     "Transfer-Encoding: chunked\r\n"
       		     "Set-Cookie: session=jnd82Nsb2VFDJdn25sAlF6sdD47wv\r\n"
-      		     "Set-Cookie: 78\r\n"
+      		     "Content-Length: 78\r\n"
       		     "\r\n%s", "<!DOCTYPE html><html><head><title>blank</title></head><body><h1>blank page</h1></body></html>");
       out_size = strlen(out);
    }
@@ -1716,7 +1828,16 @@ int relay_http_srv_handle_req(rl_arg_pass *arg) {
   
   err = 0;
 end:
-  // TODO: close c_ssl or sock connection here
+  if(c_ssl) {
+    SSL_shutdown(c_ssl);
+    SSL_free(c_ssl);
+    c_ssl = NULL;
+  }
+  
+  if(sock != -1) {
+    close(sock);
+    sock = -1;
+  }
   
   if(data) {
      free(data);
@@ -1765,7 +1886,7 @@ void proxy_srv_poll(int sock) {
       goto end;
    }
    
-   if(!parse_socks_hdr(sock_hdr_buf, sizeof(socks_hdr), &rhost, &rport)) {
+   if(!parse_socks_hdr(socks_hdr_buf, sizeof(socks_hdr), &rhost, &rport)) {
       err = 1;
       goto end;
    }
@@ -1775,9 +1896,9 @@ void proxy_srv_poll(int sock) {
      goto end;
    }
    
-   printf("target is blavbla %s:%d\n", rhost, rport):
+   printf("target is blavbla %s:%d\n", rhost, rport);
    
-   channel_id = generate_channel_id(); // TODO: also check if it already exists
+   // TODO: channel_id = generate_channel_id(); // TODO: also check if it already exists
 
   // TODO: issue CHANNEL_OPEN_CMD cmd iteratively ...
   
@@ -1798,7 +1919,7 @@ void proxy_srv_poll(int sock) {
         continue;
      } else {
         if(fds[0].revents & POLLIN) {
-            r = read(sockfd, tmp_buffer, RELAY_BUFFER_SIZE);
+            r = read(sock, tmp_buffer, RELAY_BUFFER_SIZE);
             if(r < 0) {
                // TODO: issue a cmd close command
                err = 1;
@@ -1818,6 +1939,7 @@ void proxy_srv_poll(int sock) {
         }
         
         sleep(1);
+     }
   }
   
   err = 0;
@@ -1865,7 +1987,7 @@ void start_proxy_srv(arg_pass *arg) {
   servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
   servaddr.sin_port = htons(proxy_port);
   
-  if((bind(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
+  if((bind(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
         puts("socket bind failed...");
         err = 1;
         goto end;
@@ -1895,14 +2017,14 @@ void start_proxy_srv(arg_pass *arg) {
              else if(res == ESRCH) {
                  tid[x] = 0;
                  i--;
-             else {
+             } else {
                  puts("err checking status");
                  continue; /* err checking status */
              }
           }
              
          }
-     }
+     
      
      connfd = accept(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
      if(connfd < 0) {
@@ -1958,6 +2080,21 @@ end:
   return;
 }
 
+void ssl_initialization(void) {
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+    return;
+}
+
+void ssl_cleanup(void) {
+    if(_ctx) {
+        SSL_CTX_free(_ctx);
+        _ctx = NULL;
+    }
+    return;
+}
+
 int do_http_relay_srv(char *host, int port) {
   struct sockaddr_in servaddr, cli;
   int sfd = 0;
@@ -1970,10 +2107,31 @@ int do_http_relay_srv(char *host, int port) {
   pthread_t tid[MAX_CONCURRENT_CLIENTS] = { 0 };
   rl_arg_pass *a_pass = NULL;
   int is_https = 0;
+  SSL *c_ssl = NULL;
   
   if(!host || port <= 0) {
      err = 1;
      goto end;
+  }
+  
+  is_https = (_proto == HTTPS_COM_PROTO) ? 1 : 0;
+  
+  if(is_https) {
+    ssl_initialization();
+    _ctx = SSL_CTX_new(TLS_server_method());
+    if (!_ctx) {
+     err = 1;
+     goto end;
+    }
+
+    if(SSL_CTX_use_certificate_file(_ctx, _cert_file, SSL_FILETYPE_PEM) <= 0) {
+     err = 1;
+     goto end;
+    }
+    if(SSL_CTX_use_PrivateKey_file(_ctx, _cert_file, SSL_FILETYPE_PEM) <= 0) {
+     err = 1;
+     goto end;
+    }
   }
      
   sfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1989,9 +2147,7 @@ int do_http_relay_srv(char *host, int port) {
   servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
   servaddr.sin_port = htons(port);
   
-  // TODO: apply specific things to implement HTTPS
-  
-  if((bind(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
+  if((bind(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
         puts("socket bind failed...");
         err = 1;
         goto end;
@@ -2021,20 +2177,28 @@ int do_http_relay_srv(char *host, int port) {
              else if(res == ESRCH) {
                  tid[x] = 0;
                  i--;
-             else {
+             } else {
                  puts("err checking status");
                  continue; /* err checking status */
              }
           }
              
          }
-     }
+     
      
      connfd = accept(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
      if(connfd < 0) {
         puts("failed incoming conn");
         continue;
      }
+     
+     c_ssl = SSL_new(_ctx);
+     SSL_set_fd(c_ssl, connfd);
+     
+    if(SSL_accept(c_ssl) <= 0) {
+       puts("err ssl accept");
+       continue;
+    }
      
      puts("client connected to relay srv bla bla bla!!!11");
      
@@ -2061,11 +2225,11 @@ int do_http_relay_srv(char *host, int port) {
         goto end;
      }
      
-     is_https = (_proto == HTTPS_COM_PROTO) ? 1 : 0;
-     
      a_pass->sock = connfd;
      a_pass->c_ssl = c_ssl;
      a_pass->is_https = is_https;
+     
+     c_ssl = NULL;
      
      if(pthread_create(&tid[z], NULL, relay_http_srv_handle_req, ((void *)a_pass))) {
          puts("thread creat fail");
@@ -2080,6 +2244,9 @@ int do_http_relay_srv(char *host, int port) {
   
   err = 0;
 end:
+  if(is_https)
+    ssl_cleanup();
+
   z = 0;
   while(z < MAX_CONCURRENT_CLIENTS) {
       res = pthread_cancel(tid[z]);
@@ -2127,7 +2294,7 @@ int do_tcp_relay_srv(char *host, int port) {
   servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
   servaddr.sin_port = htons(port);
   
-  if((bind(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
+  if((bind(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
         puts("socket bind failed...");
         err = 1;
         goto end;
@@ -2157,14 +2324,14 @@ int do_tcp_relay_srv(char *host, int port) {
              else if(res == ESRCH) {
                  tid[x] = 0;
                  i--;
-             else {
+             } else {
                  puts("err checking status");
                  continue; /* err checking status */
              }
           }
              
          }
-     }
+     
      
      connfd = accept(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
      if(connfd < 0) {
@@ -2220,6 +2387,7 @@ void start_relay_srv(arg_pass *arg) {
   int relay_port = 0;
   proto_t proto = 0;
   int r = 0;
+  int err = 0;
   
   if(!arg) {
         err = 1;
@@ -2361,7 +2529,7 @@ proto:
 - 2: TCP_COM_PROTO (TCP)
 
 */
-int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, int relay_port, proto_t proto, char *key, size_t key_sz, int *err) {
+int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, int relay_port, proto_t proto, char *key, size_t key_sz, char *cert_file, int *err) {
   int fail = 0;
 
   if(!proxy_host || proxy_port <= 0) {
@@ -2376,6 +2544,16 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
 
   if(proto != HTTPS_COM_PROTO && proto != HTTP_COM_PROTO &&
           proto != TCP_COM_PROTO) {
+    fail = INVALID_PARAMETER;
+    goto end;
+  }
+  
+  if(proto == HTTPS_COM_PROTO && !cert_file || strlen(cert_file) == 0) {
+    fail = INVALID_PARAMETER;
+    goto end;
+  }
+  
+  if(proto == HTTPS_COM_PROTO && !file_exists(cert_file)) {
     fail = INVALID_PARAMETER;
     goto end;
   }
@@ -2434,13 +2612,14 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
   _key = memdup(key, key_sz);
   _key_sz = key_sz;
   _proto = proto;
+  _cert_file = strdup(cert_file);
   
   if(!__start_proxy_srv(proxy_host, proxy_port)) {
      fail = SERVER_UNKNOWN_ERR;
      goto end;
   }
   
-  if(!__start_relay_srv(relay_host, relay_port)) {
+  if(!__start_relay_srv(relay_host, relay_port, proto)) {
      fail = SERVER_UNKNOWN_ERR;
      goto end;
   }
@@ -2512,7 +2691,7 @@ char *socks4_rev_strerror(int err) {
   return str_err;
 }
 
-int start_socks4_rev_proxy_nb(char *proxy_host, int proxy_port, char *relay_host, int relay_port, proto_t proto, char *key, size_t key_sz, int *err) {
+int start_socks4_rev_proxy_nb(char *proxy_host, int proxy_port, char *relay_host, int relay_port, proto_t proto, char *key, size_t key_sz, char *cert_file, int *err) {
   // non-blocking version of start_socks4_rev_proxy()
   // TODO
   return 1;
@@ -2524,7 +2703,7 @@ int main(void) {
   int err = 0;
   // note: NULL is allowed for &err arg
   // generate error codes and a translate-to-error-string table on socks4_rev_strerror() to get error information
-  if(!start_socks4_rev_proxy("127.0.0.1", 1080, "127.0.0.1", 1337, TCP_COM_PROTO, PSK, strlen(PSK), &err)) {
+  if(!start_socks4_rev_proxy("127.0.0.1", 1080, "127.0.0.1", 1337, TCP_COM_PROTO, PSK, strlen(PSK), "./cert.pem", &err)) {
       printf("Error.: Server failed. (%d): %s\n", err, socks4_rev_strerror(err));
       return 1;
   }
