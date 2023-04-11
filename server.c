@@ -105,15 +105,6 @@ typedef struct _channel_def {
   int proxy_client_sock;
 } channel_def;
 
-typedef struct _http_handshake_def {
-  int h_id;
-  char *challenge;
-  char *solution;
-  int is_solved;
-  int fail;
-  size_t sol_size;
-} http_handshake_def;
-
 typedef struct _conn_def {
   int client_id;
   int sock;
@@ -143,12 +134,14 @@ typedef struct _proxy_client_def {
   int16_t orig_port;
 } proxy_client_def;
 
-typedef struct _com_buffer_def {
-  int channel_id; // will be 0 if still not assigned or if a command (eg.: when iterating to find routes)
-  int client_id;
-  char *data;
-  size_t size;
-} com_buffer_def;
+typedef struct _http_handshake_def {
+  int h_id;
+  char *challenge;
+  char *solution;
+  int is_solved;
+  int fail;
+  size_t sol_size;
+} http_handshake_def;
 
 typedef struct __attribute__((packed)) _socks_hdr {
   uint8_t vn;
@@ -308,7 +301,15 @@ int file_exists(const char *path) {
 uint64_t generate_client_id(void) {
     uint64_t client_id = (rand() % (MAX_CLIENT_ID - MIN_CLIENT_ID + 1)) + MIN_CLIENT_ID;
     return client_id;
-} 
+}
+
+uint64_t generate_proxy_client_id(void) {
+    return generate_client_id();
+}
+
+uint64_t generate_queue_id(void) {
+    return generate_client_id();
+}
 
 uint64_t generate_channel_id(void) {
     uint64_t channel_id = (rand() % (MAX_CHANNEL_ID - MIN_CHANNEL_ID + 1)) + MIN_CHANNEL_ID;
@@ -996,6 +997,47 @@ int create_channel() {
 
 // +++++++++++++++++++++= funcs =++++++++++++++++++++++++++++++++++
 
+/*
+
+
+typedef struct _channel_def {
+  int channel_id;
+  int client_id;
+  int32_t dst_ip_addr;
+  int16_t dst_port;
+  int proxy_client_sock;
+} channel_def;
+
+typedef struct _conn_def {
+  int client_id;
+  int sock;
+  proto_t proto;
+  time_t last_conn_timestamp;
+  int32_t client_ip_addr;
+  int16_t orig_port;
+  channel_def *c_channels;
+} conn_def;
+
+typedef struct buffer_queue buffer_queue;
+
+typedef struct buffer_queue {
+  int queue_id;
+  int client_id;
+  size_t size;
+  time_t queue_time;
+  buffer_queue *next;
+  char data[0];
+};
+
+typedef struct _proxy_client_def {
+  int proxy_client_id;
+  int sock;
+  int channel_id;
+  int32_t client_ip_addr;
+  int16_t orig_port;
+} proxy_client_def;
+
+*/
 int create_channel(int client_id, int proxy_sock, char *host, int port) {
 
 }
@@ -1008,17 +1050,231 @@ int channel_exists(int channel_id) {
 
 }
 
+int client_exists(int client_id) {
+   int idx = -1;
+   // XXX: add locking
+   
+   if(client_id < 0)
+      return 0;
+
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      if(client_conns[i].client_id == client_id) {
+         idx = i;
+         break;
+      }
+   }
+   
+   if(idx == -1)
+      return 0;
+      
+   return 1;
+}
+
 /* XXX: sock = -1 if HTTP(S) */
 int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
-
+   int idx = -1;
+   int client_id = 0;
+   int32_t client_ip_addr = 0;
+   // XXX; add locking
+   
+   if(!client_ip || client_port <= 0)
+      return 0;
+   
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      if(client_conns[i].client_id == 0) {
+         idx = i;
+         break;
+      }
+   }
+   
+   if(idx == -1) {
+      return 0;
+   }
+  
+  client_ip_addr = inet_addr(client_ip);
+  
+  while(client_id = generate_client_id()) {
+     if(!client_exists(client_id))
+        break;
+  }
+  
+   client_conns[idx].client_id = client_id;
+   client_conns[idx].sock = sock;
+   client_conns[idx].proto = proto;
+   client_conns[idx].last_conn_timestamp = time(NULL);
+   client_conns[idx].client_ip_addr = client_ip_addr;
+   client_conns[idx].orig_port = (int16_t)client_port;
+   client_conns[idx].c_channels = NULL;
+   
+   return client_id;
 }
 
 int close_client(int client_id) {
+  int idx = -1;
+  // XXX: add locking
+  
+  if(client_id < 0)
+     return 0;
+     
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      if(client_conns[i].client_id == client_id) {
+         idx = i;
+         break;
+      }
+   }
+   
+   if(idx == -1) {
+      return 0;
+   }
+   
+   client_conns[idx].client_id = 0;
+   client_conns[idx].proto = 0;
+   client_conns[idx].last_conn_timestamp = 0;
+   client_conns[idx].client_ip_addr = 0;
+   client_conns[idx].orig_port = 0;
+   client_conns[idx].c_channels = NULL;
+   
+   if(client_conns[idx].sock != -1) {
+      free(client_conns[idx].sock);
+      client_conns[idx].sock = -1;
+   }
+     
   // TODO: also close every channel iteratively, closing the srv proxy side too
+  
+  return 1;
 }
 
-int client_exists(int client_id) {
+int proxy_client_exists(int proxy_client_id) {
+   int idx = -1;
+   // XXX: add locking
+   
+   if(proxy_client_id < 0)
+      return 0;
 
+   for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
+      if(proxy_client_conns[i].proxy_client_id == proxy_client_id) {
+         idx = i;
+         break;
+      }
+   }
+   
+   if(idx == -1)
+      return 0;
+      
+   return 1;
+}
+
+int create_proxy_client(int sock, char *client_ip, int client_port, int channel_id) {
+   int idx = -1;
+   int proxy_client_id = 0;
+   int32_t client_ip_addr = 0;
+   // XXX: add locking
+
+   if(sock < 0 || !client_ip || client_port <= 0 || channel_id <= 0)
+      return 0;
+
+   for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
+      if(proxy_client_conns[i].proxy_client_id == 0) {
+         idx = i;
+         break;
+      }
+   }
+   
+   if(idx == -1) {
+      return 0;
+   }
+
+  while(proxy_client_id = generate_proxy_client_id()) {
+     if(!proxy_client_exists(proxy_client_id))
+        break;
+  }
+   
+   proxy_client_conns[idx].proxy_client_id = 0;
+   proxy_client_conns[idx].sock = sock;
+   proxy_client_conns[idx].client_ip_addr = client_ip_addr;
+   proxy_client_conns[idx].orig_port = (int16_t)client_port;
+   proxy_client_conns[idx].channel_id = channel_id;
+   
+   return proxy_client_id;
+}
+
+int close_proxy_client(int proxy_client_id) {
+  int idx = -1;
+  // XXX: add locking
+  
+  if(proxy_client_id < 0)
+     return 0;
+     
+   for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
+      if(proxy_client_conns[i].proxy_client_id == proxy_client_id) {
+         idx = i;
+         break;
+      }
+   }
+   
+   if(idx == -1) {
+      return 0;
+   }
+   
+   proxy_client_conns[idx].proxy_client_id = 0;
+   proxy_client_conns[idx].client_ip_addr = 0;
+   proxy_client_conns[idx].orig_port = 0;
+   proxy_client_conns[idx].channel_id = 0;
+   
+   if(proxy_client_conns[idx].sock != -1) {
+      free(proxy_client_conns[idx].sock);
+      proxy_client_conns[idx].sock = -1;
+   }
+  
+  return 1;
+}
+
+int get_channel_by_proxy_client_id(int proxy_client_id) {
+  int idx = -1;
+  int channel_id = 0;
+  // XXX: add locking
+  
+  if(proxy_client_id < 0)
+     return 0;
+     
+   for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
+      if(proxy_client_conns[i].proxy_client_id == proxy_client_id) {
+         idx = i;
+         break;
+      }
+   }
+
+   if(idx == -1) {
+      return 0;
+   }
+   
+   channel_id = proxy_client_conns[idx].channel_id;
+   
+   return channel_id;
+}
+
+int get_sock_by_proxy_client_id(int proxy_client_id) {
+  int idx = -1;
+  int sock = 0;
+  // XXX: add locking
+  
+  if(proxy_client_id < 0)
+     return 0;
+     
+   for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
+      if(proxy_client_conns[i].proxy_client_id == proxy_client_id) {
+         idx = i;
+         break;
+      }
+   }
+
+   if(idx == -1) {
+      return 0;
+   }
+   
+   sock = proxy_client_conns[idx].sock;
+   
+   return sock;
 }
 
 int get_client_by_channel_id(int channel_id) {
@@ -1036,23 +1292,177 @@ int is_channel_by_client(int client_id, int channel_id) {
 // TODO: if HTTP(S) queue data using queue_data, else use get_relay_sock_by_client_id()
 
 int get_relay_sock_by_client_id(int client_id) {
+  int idx = -1;
+  int sock = 0;
+  // XXX: add locking
+  
+  if(client_id < 0)
+     return 0;
+     
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      if(client_conns[i].client_id == client_id) {
+         idx = i;
+         break;
+      }
+   }
 
+   if(idx == -1) {
+      return 0;
+   }
+   
+   sock = client_conns[idx].sock;
+   
+   return sock;
+}
+
+int queue_exists(int queue_id) {
+   if(queue_id < 0)
+     return 0;
+   
+   // TODO
+   
+   return 1;
 }
 
 int queue_data(int client_id, char *data, size_t data_sz, time_t timestamp) {
+   int queue_id = 0;
+   buffer_queue *qbuf = NULL;
+   char *qbuf_data = NULL;
+   // XXX: add locking
+   
+   if(client_id <= 0 || !data || data_sz == 0)
+      return 0;
+      
+  while(queue_id = generate_queue_id()) {
+     if(!queue_exists(queue_id))
+        break;
+  }
+      
+   qbuf = (buffer_queue *)calloc(sizeof(buffer_queue) + data_sz, sizeof(char));
+   if(!qbuf)
+      return 0;
+   qbuf_data = &qbuf->data[0];
 
+  qbuf->queue_id = queue_id;
+  qbuf->client_id = client_id;
+  qbuf->size = data_sz;
+  qbuf->queue_time = timestamp;
+  qbuf->next = NULL;
+  
+  memcpy(qbuf_data, data, data_sz);
+  
+   // TODO: link it to head
+    
+   return queue_id;
 }
 
 int remove_queued_data(int queue_id) {
-
+   buffer_queue *qbuf = NULL;
+   char *qbuf_data = NULL;
+   
+   if(queue_id < 0)
+      return 0;
+   
+   // TODO: grab from link
+   
+  qbuf_data = &qbuf->data[0];
+  
+  // TODO: unlink from link
+   
+  memset(qbuf_data, 0, qbuf->size);
+  
+  qbuf->queue_id = 0;
+  qbuf->client_id = 0;
+  qbuf->size = 0;
+  qbuf->queue_time = 0;
+  qbuf->next = NULL;
+  
+  if(qbuf) {
+     free(qbuf);
+     qbuf = NULL;
+  }
+   
+   return 1;
 }
 
 char *get_queued_data(int queue_id, size_t *out_size) {
-
+   char *out = NULL;
+   buffer_queue *qbuf = NULL;
+   char *qbuf_data = NULL;
+   size_t data_size = 0;
+   
+   if(queue_id < 0 || !out_size)
+     return NULL;
+     
+   *out_size = 0;
+   
+   // TODO: grab from link using queue_id
+   
+   qbuf_data = &qbuf->data[0];
+   
+   // TODO: unlink from link
+   
+  out = memdup(qbuf_data, qbuf->size);
+  if(!out)
+    return NULL;
+  data_size = qbuf->size;
+   
+  memset(qbuf_data, 0, qbuf->size);
+  
+  qbuf->queue_id = 0;
+  qbuf->client_id = 0;
+  qbuf->size = 0;
+  qbuf->queue_time = 0;
+  qbuf->next = NULL;
+  
+  if(qbuf) {
+     free(qbuf);
+     qbuf = NULL;
+  }
+  
+  *out_size = data_size;
+     
+   return out;
 }
 
 char *get_next_queued_data(int client_id, size_t *out_size) {
-    // TODO: unlink + call remove_queued_data
+   char *out = NULL;
+   buffer_queue *qbuf = NULL;
+   char *qbuf_data = NULL;
+   size_t data_size = 0;
+   
+   if(client_id < 0 || !out_size)
+     return NULL;
+     
+   *out_size = 0;
+   
+   // TODO: grab from link using client_id
+   
+   qbuf_data = &qbuf->data[0];
+   
+   // TODO: unlink from link
+   
+  out = memdup(qbuf_data, qbuf->size);
+  if(!out)
+    return NULL;
+  data_size = qbuf->size;
+   
+  memset(qbuf_data, 0, qbuf->size);
+  
+  qbuf->queue_id = 0;
+  qbuf->client_id = 0;
+  qbuf->size = 0;
+  qbuf->queue_time = 0;
+  qbuf->next = NULL;
+  
+  if(qbuf) {
+     free(qbuf);
+     qbuf = NULL;
+  }
+  
+  *out_size = data_size;
+     
+   return out;
 }
 
 // TODO: prepare design and functions for route discovery process
