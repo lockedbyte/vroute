@@ -1185,6 +1185,8 @@ int send_cmd(char *cmd, size_t cmd_sz) {
   tlv_header *tlv_p = NULL;
   char *data_x = NULL;
   size_t data_sz_x = 0;
+  char *enc = NULL;
+  size_t enc_sz = 0;
 
   if(cmd == NULL || cmd_sz == 0)
     return 0;
@@ -1201,11 +1203,25 @@ int send_cmd(char *cmd, size_t cmd_sz) {
 
   data_x = tlv_packet;
   data_sz_x = sizeof(tlv_header) + cmd_sz;
-  rx = ctl_send_data(_ctl_sock, _host, _port, &data_x, &data_sz_x, _proto);
+  
+  enc = encrypt_data(data_x, data_sz_x, _key, _key_sz, &enc_sz);
+  if(!enc) {
+    if(tlv_packet) {
+      free(tlv_packet);
+      tlv_packet = NULL;
+    }
+    return 0;
+  }
+  
+  rx = ctl_send_data(_ctl_sock, _host, _port, &enc, &enc_sz, _proto);
   if(rx < 0) {
     if(tlv_packet) {
       free(tlv_packet);
       tlv_packet = NULL;
+    }
+    if(enc) {
+      free(enc);
+      enc = NULL;
     }
     return 0;
   }
@@ -1213,6 +1229,11 @@ int send_cmd(char *cmd, size_t cmd_sz) {
   if(tlv_packet) {
     free(tlv_packet);
     tlv_packet = NULL;
+  }
+  
+  if(enc) {
+     free(enc);
+     enc = NULL;
   }
   
   return 1;
@@ -1455,16 +1476,33 @@ ssize_t send_data_to_ctl_srv(char *data, size_t data_sz) {
   ssize_t rx = 0;
   char *data_x = NULL;
   size_t data_sz_x = 0;
+  char *enc = NULL;
+  size_t enc_sz = 0;
 
   if(!data || data_sz == 0)
     return 0;
 
   data_x = data;
   data_sz_x = data_sz;
-
-  rx = ctl_send_data(_ctl_sock, _host, _port, &data_x, &data_sz_x, _proto);
-  if(rx < 0)
+  
+  enc = encrypt_data(data_x, data_sz_x, _key, _key_sz, &enc_sz) {
+  if(!enc || enc_sz == 0) {
     return 0;
+  }
+
+  rx = ctl_send_data(_ctl_sock, _host, _port, &enc, &enc_sz, _proto);
+  if(rx < 0) {
+    if(enc) {
+       free(enc);
+       enc = NULL;
+    }
+    return 0;
+  }
+  
+  if(enc) {
+     free(enc);
+     enc = NULL;
+  }
 
   return 1;
 }
@@ -1752,6 +1790,8 @@ void relay_poll(char *host, int port, proto_t proto) {
   int retval = 0;
   char *data_x = NULL;
   size_t data_sz_x = 0;
+  char *enc = NULL;
+  size_t enc_sz = 0;
   
   if(!host || port <= 0)
       return;
@@ -1769,10 +1809,6 @@ void relay_poll(char *host, int port, proto_t proto) {
 
     FD_ZERO(&rfds);
     FD_ZERO(&ofds);
-    
-    // TODO: just if TCP? 
-    //FD_SET(_ctl_sock, &rfds);
-    //n = 1;
     
     n = 0;
 
@@ -1935,15 +1971,28 @@ void relay_poll(char *host, int port, proto_t proto) {
     // If 0 bytes received, means nothing was sent by the server, so
     // No commands to interpret
 
-    rx = ctl_recv_data(_ctl_sock, host, port, &data_x, &data_sz_x, proto);
+    rx = ctl_recv_data(_ctl_sock, host, port, &enc, &enc_sz, proto);
     if(rx < 0) {
       puts("Error reading from control server");
       pthread_mutex_unlock(&glb_conn_lock);
       return;
     }
+    
+    if(enc_sz == 0) {
+      puts("No data received from control server");
+      pthread_mutex_unlock(&glb_conn_lock);
+      continue;
+    }
+    
+    data_x = decrypt_data(enc, enc_sz, _key, _key_sz, &data_sz_x);
+    if(!data_x) {
+       puts("decrypt err");
+       pthread_mutex_unlock(&glb_conn_lock);
+       continue;
+    }
 
     if(data_sz_x == 0) {
-      puts("No data received from control server");
+      puts("No data received from control server (2)");
       pthread_mutex_unlock(&glb_conn_lock);
       continue;
     }
@@ -1973,6 +2022,11 @@ void relay_poll(char *host, int port, proto_t proto) {
     if(data_x) {
       free(data_x);
       data_x = NULL;
+    }
+    
+    if(enc) {
+       free(enc);
+       enc = NULL;
     }
 
     if(data_sz_x != recv_tlv->tlv_data_len) {
@@ -2127,7 +2181,6 @@ int start_relay_conn(char *host, int port, proto_t proto, char *key, size_t key_
        sleep(2);
     }
     
-    // TODO: make sure to cleanup everything before returning to caller program
     if(srv_down)
       return 0;
 
