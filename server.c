@@ -7,6 +7,8 @@ TODO:
 - functions to cleanup proxy_client_conns and client_conns (contained pointers) in case srv_close is set
 - properly handle srv_close in every aspect of the program execution flow
 - HTTPS impl
+- create a crypt.c/crypt.h
+- create a util.c/util.h
 
 - relationship points between both servers (client_ids, channel_ids, queued buffers etc)
 
@@ -83,6 +85,8 @@ TODO:
 #define MAX_CHALL_CHR_VAL 0xff
 
 #define MAX_KEY_SIZE 64
+
+#define LAST_CONN_GAP_THRESHOLD 60 * 5 // 5 minutes
 
 typedef enum {
   HTTPS_COM_PROTO = 0,
@@ -335,6 +339,73 @@ int handshake_sess_exists(int h_id) {
    }
      
    return 1;
+}
+
+ssize_t write_all(int sock, char **data, size_t *data_sz) {
+  int r = 0;
+  size_t sent = 0;
+  char *ptr = NULL;
+  size_t sz = 0;
+
+  if(sock < 0 || !data || !data_sz)
+    return -1;
+
+  if(data && data_sz) {
+    ptr = *data;
+    sz = *data_sz;
+  }
+
+  while(sent < sz) {
+    r = write(sock, ptr, sz - sent);
+    if(r < 0)
+      return -1;
+    sent += r;
+  }
+
+  return sent;
+}
+
+ssize_t read_all(int sock, char **data, size_t *data_sz) {
+  int bytes_available = 0;
+  size_t sent = 0;
+  int r = 0;
+  char *ptr = NULL;
+
+  if(sock < 0 || !data || !data_sz)
+    return -1;
+
+  *data = NULL;
+  *data_sz = 0;
+
+  #if WINDOWS_OS
+  r = ioctlsocket(sock, FIONREAD, &bytes_available);
+  #else
+  r = ioctl(sock, FIONREAD, &bytes_available);
+  #endif
+  if(r < 0)
+    return -1;
+
+  if(bytes_available < 0) {
+    *data = NULL;
+    *data_sz = 0;
+    return 0;
+  }
+
+  ptr = calloc(bytes_available + 1, sizeof(char));
+  if(!ptr)
+    return -1;
+
+  while(sent < bytes_available) {
+    r = read(sock, ptr, bytes_available - sent);
+    if(r < 0)
+      return -1;
+    sent += r;
+  }
+
+  *data = ptr;
+  *data_sz = bytes_available;
+
+  return sent;
 }
 
 int is_challenge_solved(int h_id) {
@@ -936,65 +1007,6 @@ char *encrypt_challenge(char *data, size_t data_sz, char *key, size_t key_sz, si
   return ciphertext;
 }
 
-int cl_channel_id_exists(int channel_id, int client_idx) {
-  // XXX: locking relies on caller
-  int idx = -1;
-
-  if(channel_id < 0)
-    return 0;
-
-  if(!client_conns || client_idx < 0 || client_idx > MAX_CONCURRENT_CLIENTS || !client_conns[client_idx].c_channels)
-    return 0;
-
-  for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
-    if(client_conns[client_idx].c_channels[x].channel_id == channel_id) {
-      idx = x;
-      break;
-    }
-  }
-
-  if(idx == -1)
-    return 0;
-  return 1;
-}
-
-int channel_id_exists(int channel_id) {
-  // TODO: add locking
-  int idx = -1;
-
-  if(channel_id <= 0)
-    return 0;
-
-  for(int i = 0 ; i < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; i++) {
-    if(client_conns[i].c_channels) {
-      if(cl_channel_id_exists(channel_id, i)) {
-        idx = i;
-        break;
-      }
-    }
-  }
-
-  if(idx == -1)
-    return 0;
-  return 1;
-}
-
-#if 0
-int create_channel() {
-  int channel_id = 0;
-  //...
-  while(1) {
-    channel_id = generate_channel_id();
-    if(channel_id != 0 && !channel_id_exists(channel_id))
-      break;
-  }
-  // ...
-  // TODO
-  
-  return channel_id;
-}
-#endif
-
 // +++++++++++++++++++++= funcs =++++++++++++++++++++++++++++++++++
 
 /*
@@ -1039,15 +1051,201 @@ typedef struct _proxy_client_def {
 
 */
 int create_channel(int client_id, int proxy_sock, char *host, int port) {
+   int c_idx = -1;
+   int idx = -1;
+   int channel_id = 0;
+   int32_t dst_ip_addr = 0;
+   // XXX: add locking
+   
+   if(client_id < 0 || proxy_sock < 0 || !host || port <= 0)
+      return 0;
 
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      if(client_conns[i].client_id == client_id) {
+         c_idx = i;
+         break;
+      }
+   }
+   
+   if(c_idx = -1) {
+      return 0;
+   }
+   
+   for(int i = 0 ; i < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; i++) {
+      if(client_conns[c_idx].c_channels && client_conns[c_idx].c_channels[i].channel_id == 0) {
+         idx = i;
+         break;
+      }
+   }
+   
+   if(idx == -1) {
+      return 0;
+   }
+  
+  dst_ip_addr = inet_addr(host);
+  
+  while(channel_id = generate_channel_id()) {
+     if(!channel_exists(channel_id))
+        break;
+  }
+
+   client_conns[c_idx].c_channels[idx].channel_id = channel_id;
+   client_conns[c_idx].c_channels[idx].client_id = client_id;
+   client_conns[c_idx].c_channels[idx].dst_ip_addr = dst_ip_addr;
+   client_conns[c_idx].c_channels[idx].dst_port = (int16_t)port;
+   client_conns[c_idx].c_channels[idx].proxy_client_sock = proxy_sock;
+   
+   return channel_id;
 }
 
 int close_channel(int channel_id) {
-  // TODO: also close the srv proxy side too
+   int idx = -1;
+   int c_idx = -1;
+   // XXX: add locking
+   
+  if(channel_id < 0)
+     return 0;
+
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
+         if(client_conns[i].c_channels && client_conns[i].c_channels[x].channel_id == channel_id) {
+            c_idx = i;
+            idx = x;
+            break;
+         }
+      }
+   }
+   
+   if(idx == -1 || c_idx == -1) {
+      return 0;
+   }
+   
+   client_conns[c_idx].c_channels[idx].channel_id = 0;
+   client_conns[c_idx].c_channels[idx].client_id = 0;
+   client_conns[c_idx].c_channels[idx].dst_ip_addr = 0;
+   client_conns[c_idx].c_channels[idx].dst_port = 0;
+   
+   if(client_conns[c_idx].c_channels[idx].proxy_client_sock != -1) {
+      close(client_conns[c_idx].c_channels[idx].proxy_client_sock);
+      client_conns[c_idx].c_channels[idx].proxy_client_sock = -1;
+   }
+   
+   if(!send_remote_cmd(CHANNEL_CLOSE_CMD, channel_id))
+      return 0;
+  
+  return 1;
 }
 
 int channel_exists(int channel_id) {
+   int idx = -1;
+   int c_idx = -1;
+   // XXX: add locking
+   
+  if(channel_id < 0)
+     return 0;
 
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
+         if(client_conns[i].c_channels && client_conns[i].c_channels[x].channel_id == channel_id) {
+            c_idx = i;
+            idx = x;
+            break;
+         }
+      }
+   }
+   
+   if(idx == -1 || c_idx == -1) {
+      return 0;
+   }
+   
+   return 1;
+}
+
+int get_client_by_channel_id(int channel_id) {
+   int idx = -1;
+   int c_idx = -1;
+   int client_id = 0;
+   // XXX: add locking
+   
+  if(channel_id < 0)
+     return 0;
+
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
+         if(client_conns[i].c_channels && client_conns[i].c_channels[x].channel_id == channel_id) {
+            c_idx = i;
+            idx = x;
+            break;
+         }
+      }
+   }
+   
+   if(idx == -1 || c_idx == -1) {
+      return 0;
+   }
+   
+   client_id = client_conns[c_idx].c_channels[idx].client_id;
+   
+   return client_id;
+}
+
+int get_proxy_sock_by_channel_id(int channel_id) {
+   int idx = -1;
+   int c_idx = -1;
+   int proxy_client_sock = 0;
+   // XXX: add locking
+   
+  if(channel_id < 0)
+     return 0;
+
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
+         if(client_conns[i].c_channels && client_conns[i].c_channels[x].channel_id == channel_id) {
+            c_idx = i;
+            idx = x;
+            break;
+         }
+      }
+   }
+   
+   if(idx == -1 || c_idx == -1) {
+      return 0;
+   }
+   
+   proxy_client_sock = client_conns[c_idx].c_channels[idx].proxy_client_sock;
+   
+   return proxy_client_sock;
+}
+
+int is_channel_by_client(int client_id, int channel_id) {
+   int idx = -1;
+   int c_idx = -1;
+   int cid = 0;
+   // XXX: add locking
+   
+  if(client_id < 0 || channel_id < 0)
+     return 0;
+
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
+         if(client_conns[i].c_channels && client_conns[i].c_channels[x].channel_id == channel_id) {
+            c_idx = i;
+            idx = x;
+            break;
+         }
+      }
+   }
+   
+   if(idx == -1 || c_idx == -1) {
+      return 0;
+   }
+   
+   cid = client_conns[c_idx].c_channels[idx].client_id;
+   
+   if(cid != client_id)
+      return 0;
+   
+   return 1;
 }
 
 int client_exists(int client_id) {
@@ -1070,15 +1268,13 @@ int client_exists(int client_id) {
    return 1;
 }
 
-/* XXX: sock = -1 if HTTP(S) */
+/* XXX: sock == -1 if HTTP(S) */
 int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
    int idx = -1;
    int client_id = 0;
    int32_t client_ip_addr = 0;
+   channel_def *c_channels = NULL;
    // XXX; add locking
-   
-   if(!client_ip || client_port <= 0)
-      return 0;
    
    for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
       if(client_conns[i].client_id == 0) {
@@ -1091,11 +1287,17 @@ int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
       return 0;
    }
   
-  client_ip_addr = inet_addr(client_ip);
+  if(client_ip)
+     client_ip_addr = inet_addr(client_ip);
   
   while(client_id = generate_client_id()) {
      if(!client_exists(client_id))
         break;
+  }
+  
+  c_channels = (channel_def *)calloc(MAX_CONCURRENT_CHANNELS_PER_CLIENT, sizeof(channel_def));
+  if(!c_channels) {
+     return 0;
   }
   
    client_conns[idx].client_id = client_id;
@@ -1104,7 +1306,7 @@ int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
    client_conns[idx].last_conn_timestamp = time(NULL);
    client_conns[idx].client_ip_addr = client_ip_addr;
    client_conns[idx].orig_port = (int16_t)client_port;
-   client_conns[idx].c_channels = NULL;
+   client_conns[idx].c_channels = c_channels;
    
    return client_id;
 }
@@ -1132,16 +1334,50 @@ int close_client(int client_id) {
    client_conns[idx].last_conn_timestamp = 0;
    client_conns[idx].client_ip_addr = 0;
    client_conns[idx].orig_port = 0;
-   client_conns[idx].c_channels = NULL;
+   
+   for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
+      if(client_conns[idx].c_channels && client_conns[idx].c_channels[x].channel_id != 0) {
+	   client_conns[idx].c_channels[x].channel_id = 0;
+	   client_conns[idx].c_channels[x].client_id = 0;
+	   client_conns[idx].c_channels[x].dst_ip_addr = 0;
+	   client_conns[idx].c_channels[x].dst_port = 0;
+	   
+	   if(client_conns[idx].c_channels[x].proxy_client_sock != -1) {
+	      close(client_conns[idx].c_channels[x].proxy_client_sock);
+	      client_conns[idx].c_channels[x].proxy_client_sock = -1;
+	   }
+      }
+    }
+   
+   if(client_conns[idx].c_channels) {
+      free(client_conns[idx].c_channels);
+      client_conns[idx].c_channels = NULL;
+   }
    
    if(client_conns[idx].sock != -1) {
       free(client_conns[idx].sock);
       client_conns[idx].sock = -1;
    }
-     
-  // TODO: also close every channel iteratively, closing the srv proxy side too
   
   return 1;
+}
+
+void close_all_clients(void) {
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      if(client_conns[i].client_id != 0) {
+         close_client(client_conns[i].client_id);
+      }
+   }
+   return;
+}
+
+void close_all_proxy_clients(void) {
+   for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
+      if(proxy_client_conns[i].proxy_client_id != 0) {
+         close_proxy_client(proxy_client_conns[i].proxy_client_id);
+      }
+   }
+   return;
 }
 
 int proxy_client_exists(int proxy_client_id) {
@@ -1170,7 +1406,7 @@ int create_proxy_client(int sock, char *client_ip, int client_port, int channel_
    int32_t client_ip_addr = 0;
    // XXX: add locking
 
-   if(sock < 0 || !client_ip || client_port <= 0 || channel_id <= 0)
+   if(sock < 0 || channel_id <= 0)
       return 0;
 
    for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
@@ -1188,6 +1424,9 @@ int create_proxy_client(int sock, char *client_ip, int client_port, int channel_
      if(!proxy_client_exists(proxy_client_id))
         break;
   }
+  
+  if(client_ip)
+     client_ip_addr = inet_addr(client_ip);
    
    proxy_client_conns[idx].proxy_client_id = 0;
    proxy_client_conns[idx].sock = sock;
@@ -1277,20 +1516,6 @@ int get_sock_by_proxy_client_id(int proxy_client_id) {
    return sock;
 }
 
-int get_client_by_channel_id(int channel_id) {
-
-}
-
-int get_proxy_sock_by_channel_id(int channel_id) {
-
-}
-
-int is_channel_by_client(int client_id, int channel_id) {
-
-}
-
-// TODO: if HTTP(S) queue data using queue_data, else use get_relay_sock_by_client_id()
-
 int get_relay_sock_by_client_id(int client_id) {
   int idx = -1;
   int sock = 0;
@@ -1316,10 +1541,25 @@ int get_relay_sock_by_client_id(int client_id) {
 }
 
 int queue_exists(int queue_id) {
+   buffer_queue *p = NULL;
+   int found = 0;
+   // XXX: add locking
+   
    if(queue_id < 0)
      return 0;
    
-   // TODO
+   p = head;
+   while(p) {
+      if(p->queue_id == queue_id) {
+         found = 1;
+         break;
+      }
+      p = p->next;
+   }
+   
+   if(!found) {
+      return 0;
+   }
    
    return 1;
 }
@@ -1327,6 +1567,7 @@ int queue_exists(int queue_id) {
 int queue_data(int client_id, char *data, size_t data_sz, time_t timestamp) {
    int queue_id = 0;
    buffer_queue *qbuf = NULL;
+   buffer_queue *p = NULL;
    char *qbuf_data = NULL;
    // XXX: add locking
    
@@ -1351,7 +1592,22 @@ int queue_data(int client_id, char *data, size_t data_sz, time_t timestamp) {
   
   memcpy(qbuf_data, data, data_sz);
   
-   // TODO: link it to head
+  p = head;
+  
+  if(!p) {
+     head = qbuf;
+  } else {
+     while(p->next != NULL) {
+        p = p->next;
+     }
+     
+     if(p->next != NULL) {
+        puts("what tha fuck");
+        return 0;
+     }
+     
+     p->next = qbuf;
+  }
     
    return queue_id;
 }
@@ -1359,15 +1615,37 @@ int queue_data(int client_id, char *data, size_t data_sz, time_t timestamp) {
 int remove_queued_data(int queue_id) {
    buffer_queue *qbuf = NULL;
    char *qbuf_data = NULL;
+   buffer_queue *p = NULL;
+   buffer_queue *prev = NULL;
+   int found = 0;
+   // XXX: add locking
    
    if(queue_id < 0)
       return 0;
    
-   // TODO: grab from link
+   prev = NULL;
+   p = head;
+   while(p) {
+      if(p->queue_id == queue_id) {
+         found = 1;
+         break;
+      }
+      prev = p;
+      p = p->next;
+   }
+   
+   if(!found)
+      return 0;
+      
+   qbuf = p;
    
   qbuf_data = &qbuf->data[0];
   
-  // TODO: unlink from link
+   if(prev) {
+      prev->next = p->next;
+   } else {
+      head = p->next;
+   }
    
   memset(qbuf_data, 0, qbuf->size);
   
@@ -1390,17 +1668,39 @@ char *get_queued_data(int queue_id, size_t *out_size) {
    buffer_queue *qbuf = NULL;
    char *qbuf_data = NULL;
    size_t data_size = 0;
+   buffer_queue *p = NULL;
+   buffer_queue *prev = NULL;
+   int found = 0;
+   // XXX: add locking
    
    if(queue_id < 0 || !out_size)
      return NULL;
      
    *out_size = 0;
    
-   // TODO: grab from link using queue_id
+   prev = NULL;
+   p = head;
+   while(p) {
+      if(p->queue_id == queue_id) {
+         found = 1;
+         break;
+      }
+      prev = p;
+      p = p->next;
+   }
+   
+   if(!found)
+      return 0;
+      
+   qbuf = p;
    
    qbuf_data = &qbuf->data[0];
    
-   // TODO: unlink from link
+   if(prev) {
+      prev->next = p->next;
+   } else {
+      head = p->next;
+   }
    
   out = memdup(qbuf_data, qbuf->size);
   if(!out)
@@ -1430,17 +1730,39 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
    buffer_queue *qbuf = NULL;
    char *qbuf_data = NULL;
    size_t data_size = 0;
+   buffer_queue *p = NULL;
+   buffer_queue *prev = NULL;
+   int found = 0;
+   // XXX: add locking
    
    if(client_id < 0 || !out_size)
      return NULL;
      
    *out_size = 0;
    
-   // TODO: grab from link using client_id
+   prev = NULL;
+   p = head;
+   while(p) {
+      if(p->client_id == client_id) {
+         found = 1;
+         break;
+      }
+      prev = p;
+      p = p->next;
+   }
+   
+   if(!found)
+      return 0;
+      
+   qbuf = p;
    
    qbuf_data = &qbuf->data[0];
    
-   // TODO: unlink from link
+   if(prev) {
+      prev->next = p->next;
+   } else {
+      head = p->next;
+   }
    
   out = memdup(qbuf_data, qbuf->size);
   if(!out)
@@ -1500,25 +1822,63 @@ int parse_socks_hdr(char *data, size_t data_sz, char **host, int **port) {
 }
 
 void collect_dead_clients_worker(void) {
-  // ... for TCP conns try to connect, if fails remove client...
-  // ...for HTTP(S) conns set a max last_conn_timestamp...
-  // TODO
+  // XXX: add locking
+  
+  time_t last;
+  time_t curr = time(NULL);
+  long gap = 0;
+  
+   for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+      if(client_conns[i].client_id != 0 && (client_conns[i].proto == HTTP_COM_PROTO ||
+            client_conns[i].proto == HTTPS_COM_PROTO)) {
+         last = client_conns[i].last_conn_timestamp;
+         
+         gap = curr - last;
+         
+         if(gap > LAST_CONN_GAP_THRESHOLD) {
+            close_client(client_conns[i].client_id);
+         }
+      }
+   }
+   
   return;
 }
 
-int send_remote_cmd(int sock, scmd_t cmd, int channel_id) {
+int send_remote_cmd(scmd_t cmd, int channel_id) {
+  if(channel_id < 0)
+    return 0;
+    
   // TODO
+  
   return 1;
 }
 
 int interpret_remote_cmd(char *cmd, size_t cmd_sz) {
+  if(!cmd || cmd_sz == 0)
+     return 0;
+     
   // TODO
+  
   return 1;
 }
 
 int interpret_remote_packet(int client_id, char *data, size_t data_sz) {
+  if(client_id < 0 || !data || data_sz == 0)
+     return 0;
+     
   // TODO
   //    unpack structure, if client_id == 0 means command, else data to redirect to proxy srv side
+  
+  return 1;
+}
+
+char *pack_proxy_data(int channel_id, char *data, size_t size, size_t *out_size) {
+   if(channel_id < 0 || !data || size == 0 || !out_size)
+      return NULL;
+      
+   *out_size = 0;
+   
+   // TODO
 }
 
 /*
@@ -1626,13 +1986,18 @@ int handshake(int sock) {
     if(memcmp(p_clt, p, out_size) != 0) {
        cid = 0;
     } else {
-       cid = generate_client_id(); // TODO: also check if it already exists
-       // TODO: init cid
+       cid = create_client(sock, NULL, 0, TCP_COM_PROTO);
+       if(cid <= 0) {
+          err = 1;
+          goto end;
+       }
     }
     
     r = write(sock, &cid, sizeof(uint32_t));
-    if(r <= 0 || r != sizeof(uint32_t))
-        return 0;
+    if(r <= 0 || r != sizeof(uint32_t)) {
+        err = 1;
+        goto end;
+    }
         
     if(cid == 0) {
         err = 1;
@@ -1651,8 +2016,11 @@ end:
        p_clt = NULL;
     }
   
-  if(err)
+  if(err) {
+    if(cid)
+       close_client(cid);
     return 0;
+  }
     
   return cid;
 }
@@ -1663,7 +2031,9 @@ int relay_tcp_srv_poll(int sock) {
   int cid = 0;
   int res = 0;
   struct pollfd fds[1] = { -1 };
-  char tmp_buffer[RELAY_BUFFER_SIZE + 1] = { 0 };
+  char *tmp_buffer = NULL;
+  size_t tmp_buffer_sz = 0;
+  ssize_t rx = 0;
   
   if(sock < 0) {
      err = 1;
@@ -1679,32 +2049,49 @@ int relay_tcp_srv_poll(int sock) {
   fds[0].events = POLLIN;
   
   while(1) {
-     memset(tmp_buffer, 0, RELAY_BUFFER_SIZE);
-     
+     if(tmp_buffer) {
+        free(tmp_buffer);
+        tmp_buffer = NULL;
+     }     
      res = poll(fds, 1, -1);
      if(res == -1) {
-        // TODO: mark client and its channels as close (plus close proxy srv side of each fucked channel)
+        if(cid) {
+            close_client(cid);
+            cid = 0;
+        }
         err = 1;
         goto end;
      } else if(res == 0) {
         continue;
      } else {
         if(fds[0].revents & POLLIN) {
-            r = read(sock, tmp_buffer, RELAY_BUFFER_SIZE);
-            if(r < 0) {
-               // TODO: mark client and its channels as close (plus close proxy srv side of each fucked channel)
+            rx = read_all(sock, &tmp_buffer, &tmp_buffer_sz) {
+            if(rx < 0) {
+               if(cid) {
+                 close_client(cid);
+                 cid = 0;
+               }
                err = 1;
                goto end;
-            } else if(r == 0) { /* conn closed */
-               // TODO: mark client and its channels as close (plus close proxy srv side of each fucked channel)
+            } else if(rx == 0) { /* conn closed */
+               if(cid) {
+                 close_client(cid);
+                 cid = 0;
+               }
                err = 0;
                goto end;
             }
             
-            // TODO: send the data from tmp_buffer (send it to proxy conn side): MAKE SURE TO USE r AND NOT RELAY_BUFFER_SIZE
+            if(!interpret_remote_packet(cid, tmp_buffer, tmp_buffer_sz)) {
+               err = 1;
+               goto end;
+            }
             
         } else if((fds[0].revents & POLLHUP) != 0) { /* conn closed */
-           // TODO: mark client and its channels as close (plus close proxy srv side of each fucked channel)
+           if(cid) {
+             close_client(cid);
+             cid = 0;
+           }
            err = 0;
            goto end;
         }
@@ -1715,7 +2102,16 @@ int relay_tcp_srv_poll(int sock) {
   
   err = 0;
 end:
-  // TODO: mark client_id as closed
+  if(cid > 0) {
+    close_client(cid);
+    cid = 0;
+  }
+
+  if(tmp_buffer) {
+     free(tmp_buffer);
+     tmp_buffer = NULL;
+  }     
+     
   if(sock != -1) {
     close(sock);
     sock = -1;
@@ -2011,6 +2407,10 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
    char *raw = NULL;
    size_t raw_sz = 0;
    int param = 0;
+   char *enc = NULL;
+   size_t enc_sz = 0;
+   char *qdata = NULL;
+   size_t qsize = 0;
    req_t req_type = UNKNOWN_REQUEST_TYPE;
    
    if(!data || data_sz == 0 || !out_size)
@@ -2052,10 +2452,16 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
            cid = param;
            
            if(req_type == DATA_SENDING_TYPE) {
-		  raw = get_data_from_http(data, data_sz, &raw_sz);
-		  if(raw || raw_sz == 0) {
+		  enc = get_data_from_http(data, data_sz, &enc_sz);
+		  if(enc || enc_sz == 0) {
 		      err = 1;
 		      goto end;
+		  }
+		  
+		  raw = decrypt_data(enc, enc_sz, _key, _key_sz, &raw_sz);
+		  if(!raw || raw_sz == 0) {
+		     err = 1;
+		     goto end;
 		  }
 		   
 		 if(!interpret_remote_packet(cid, raw, raw_sz)) {
@@ -2073,8 +2479,42 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
 	   } else if(req_type == DATA_REQUEST_TYPE) {
 	   	   // TODO: [...]
 	   	   //   check if we are in the process of route discovery, if so prorize it over queued buffers
-	   	   //   if no discovery process currently, grab next queued buffer with that cid and return it
-	   	   // TODO: get_http_data_response
+	   	   
+	   	   qdata = get_next_queued_data(cid, &qsize);
+	   	   if(!qdata || qsize == 0) {
+	   	      *out_size = 0;
+	   	      return NULL;
+	   	   }
+	   	   
+	   	   enc = encrypt_data(qdata, qsize, _key, _key_sz, &enc_sz);
+	   	   if(!enc) {
+	   	      if(qdata) {
+	   	         free(qdata);
+	   	         qdata = NULL;
+	   	      }
+	   	      *out_size = 0;
+	   	      return NULL;
+	   	   }
+	   	   
+	   	   if(qdata) {
+	   	      free(qdata);
+	   	      qdata = NULL;
+	   	   }
+	   	   
+                   out = get_http_data_response(enc, enc_sz, &osz);
+                   if(!out || osz == 0) {
+                     if(enc) {
+                       free(enc);
+                       enc = NULL;
+                     }
+                     err = 1;
+                     goto end;
+                   }
+                   
+                   if(enc) {
+                     free(enc);
+                     enc = NULL;
+                   }
 	   }
    } else if(req_type == HANDSHAKE_SESSION_TYPE) {
 
@@ -2084,8 +2524,11 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
             if(is_challenge_solved(h_id) || is_challenge_failure(h_id)) {
             
                if(is_challenge_solved(h_id)) {
-               // TODO: create a new client in structures
-               // TODO: initialize 'cid' to new client id
+                 cid = create_client(-1, NULL, 0, _proto);
+                 if(cid <= 0) {
+                    err = 1;
+                    goto end;
+                 }
                } else if (is_challenge_failure(h_id)) {
                  cid = 0;
                } else {
@@ -2279,6 +2722,10 @@ void proxy_srv_poll(int sock) {
    char tmp_buffer[RELAY_BUFFER_SIZE + 1] = { 0 };
    int client_id = 0;
    int channel_id = 0;
+   char *p = NULL;
+   size_t p_sz = 0;
+   int rsock = 0;
+   ssize_t rx = 0;
    
    if(sock < 0) {
      err = 1;
@@ -2322,7 +2769,6 @@ void proxy_srv_poll(int sock) {
      
      res = poll(fds, 1, -1);
      if(res == -1) {
-        // TODO: issue a cmd close command
         err = 1;
         goto end;
      } else if(res == 0) {
@@ -2331,19 +2777,53 @@ void proxy_srv_poll(int sock) {
         if(fds[0].revents & POLLIN) {
             r = read(sock, tmp_buffer, RELAY_BUFFER_SIZE);
             if(r < 0) {
-               // TODO: issue a cmd close command
                err = 1;
                goto end;
             } else if(r == 0) { /* conn closed */
-               // TODO: issue a cmd close command
                err = 0;
                goto end;
             }
             
-            // TODO: send the data from tmp_buffer (queue it or send it to target conn)
+            p = pack_proxy_data(channel_id, tmp_buffer, RELAY_BUFFER_SIZE, &p_sz);
+            if(!p) {
+              err = 1;
+              goto end;
+            }
+
+             client_id = get_client_by_channel_id(channel_id);
+             if(client_id < 0) {
+                err = 1;
+                goto end;
+             }
+               
+            if(_proto == TCP_COM_PROTO) {
+               
+               rsock = get_relay_sock_by_client_id(client_id);
+               if(rsock < 0) {
+                  err = 1;
+                  goto enc;
+               }
+               
+               rx = write_all(rsock, &p, &p_sz);
+               if(rx < 0) {
+                 err = 1;
+                 goto end;
+               }
+               
+            } else if(_proto == HTTP_COM_PROTO || 
+                _proto == HTTPS_COM_PROTO) {
+                 if(!queue_data(client_id, p, p_sz, time(NULL))) {
+                    err = 1;
+                    goto end;
+                 }
+            }
+            
+            if(p) {
+               free(p);
+               p = NULL;
+            }
             
         } else if((fds[0].revents & POLLHUP) != 0) { /* conn closed */
-           // TODO: issue a cmd close command
            err = 0;
            goto end;
         }
@@ -2354,6 +2834,10 @@ void proxy_srv_poll(int sock) {
   
   err = 0;
 end:
+  if(channel_id) {
+     close_channel(channel_id);
+     channel_id = 0;
+  }
   pthread_exit(NULL);
   return;
 }
@@ -2369,7 +2853,10 @@ void start_proxy_srv(arg_pass *arg) {
   int connfd = 0;
   int z = 0;
   int idx = 0;
+  size_t addr_len = 0;
+  int port = 0;
   pthread_t tid[MAX_CONCURRENT_PROXY_CLIENTS] = { 0 };
+  char ip[INET_ADDRSTRLEN] = { 0 };
   
   if(!arg) {
         err = 1;
@@ -3035,12 +3522,6 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
   }
   
   __ping_worker();
-
-  // start in a new thread start_proxy_srv and start_relay_srv
-  // start a poll that does multiple stuff like collect_dead_clients_worker in main thread
-  // check for close_srv in every thread, if 1, close all of them
-  
-  // TODO
   
   while(1) {
      if(close_srv)
@@ -3060,7 +3541,8 @@ end:
       *err = fail;
   }
   
-  // TODO: cleanup contained pointers too!
+  close_all_proxy_clients();
+  close_all_clients();
   
   if(proxy_client_conns) {
      free(proxy_client_conns);
