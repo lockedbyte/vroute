@@ -2358,7 +2358,7 @@ char *get_http_data_response(char *data, size_t data_sz, size_t *out_size) {
     
   *out_size = 0;
   
-  b64_p = base64_decode(data, data_sz, &b64_sz);
+  b64_p = base64_encode(data, data_sz, &b64_sz);
   if(!b64_p || b64_sz == 0) {
      *out_size = 0;
      return NULL;
