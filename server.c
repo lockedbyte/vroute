@@ -544,7 +544,7 @@ int create_handshake(int h_id) {
    
     generate_random_challenge(chall, CHALLENGE_DEFAULT_SIZE);
    
-    sol_a = encrypt_challenge(chall, CHALLENGE_DEFAULT_SIZE, _key, _key_sz, &sol_size_a);
+    sol_a = encrypt_challenge((char *)chall, CHALLENGE_DEFAULT_SIZE, _key, _key_sz, &sol_size_a);
     if(!sol_a) {
         return 0;
     }
@@ -710,6 +710,9 @@ char *sha256_hash(char *data, size_t size, size_t *out_sz) {
     SHA256(data, size, hash_fixed);
 
     hash = memdup(hash_fixed, SHA256_DIGEST_LENGTH);
+    if(!hash)
+        return NULL;
+       
     *out_sz = SHA256_DIGEST_LENGTH;
 
     return hash;
@@ -1539,7 +1542,7 @@ int queue_exists(int queue_id) {
     if(queue_id < 0)
         return 0;
 
-    p = head;
+    p = queue_head;
     while(p) {
         if(p->queue_id == queue_id) {
             found = 1;
@@ -1583,10 +1586,10 @@ int queue_data(int client_id, char *data, size_t data_sz, time_t timestamp) {
   
     memcpy(qbuf_data, data, data_sz);
   
-    p = head;
+    p = queue_head;
   
     if(!p) {
-        head = qbuf;
+        queue_head = qbuf;
     } else {
         while(p->next != NULL) {
             p = p->next;
@@ -1615,7 +1618,7 @@ int remove_queued_data(int queue_id) {
         return 0;
    
     prev = NULL;
-    p = head;
+    p = queue_head;
     while(p) {
         if(p->queue_id == queue_id) {
             found = 1;
@@ -1635,7 +1638,7 @@ int remove_queued_data(int queue_id) {
     if(prev) {
         prev->next = p->next;
     } else {
-        head = p->next;
+        queue_head = p->next;
     }
 
     memset(qbuf_data, 0, qbuf->size);
@@ -1670,7 +1673,7 @@ char *get_queued_data(int queue_id, size_t *out_size) {
     *out_size = 0;
    
     prev = NULL;
-    p = head;
+    p = queue_head;
     while(p) {
         if(p->queue_id == queue_id) {
             found = 1;
@@ -1690,7 +1693,7 @@ char *get_queued_data(int queue_id, size_t *out_size) {
     if(prev) {
         prev->next = p->next;
     } else {
-        head = p->next;
+        queue_head = p->next;
     }
    
     out = memdup(qbuf_data, qbuf->size);
@@ -1732,7 +1735,7 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
     *out_size = 0;
    
     prev = NULL;
-    p = head;
+    p = queue_head;
     while(p) {
         if(p->client_id == client_id) {
             found = 1;
@@ -1752,7 +1755,7 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
     if(prev) {
         prev->next = p->next;
     } else {
-        head = p->next;
+        queue_head = p->next;
     }
 
     out = memdup(qbuf_data, qbuf->size);
@@ -1860,7 +1863,7 @@ int send_remote_cmd(scmd_t cmd, int channel_id) {
     }
   
     p_sz = sizeof(tlv_header) + sizeof(s_cmd);
-    p = calloc(p_Sz, sizeof(char));
+    p = calloc(p_sz, sizeof(char));
     if(!p)
         return 0;
     tlv = (tlv_header *)p;
@@ -2195,7 +2198,7 @@ int relay_tcp_srv_poll(int sock) {
             continue;
         } else {
             if(fds[0].revents & POLLIN) {
-                rx = read_all(sock, &tmp_buffer, &tmp_buffer_sz) {
+                rx = read_all(sock, &tmp_buffer, &tmp_buffer_sz);
                 if(rx < 0) {
                     if(cid) {
                         close_client(cid);
@@ -2924,7 +2927,7 @@ void proxy_srv_poll(int sock) {
                     rsock = get_relay_sock_by_client_id(client_id);
                     if(rsock < 0) {
                         err = 1;
-                        goto enc;
+                        goto end;
                     }
 
                     rx = write_all(rsock, &p, &p_sz);

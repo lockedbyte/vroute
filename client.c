@@ -485,17 +485,20 @@ size_t get_decrypted_size(char *enc, size_t enc_sz) {
 char *sha256_hash(char *data, size_t size, size_t *out_sz) {
     char *hash = NULL;
     unsigned char hash_fixed[SHA256_DIGEST_LENGTH + 1] = { 0 };
-    
+
     if(!data || size == 0 || !out_sz)
         return NULL;
-    
+
     *out_sz = 0;
-    
+
     SHA256(data, size, hash_fixed);
-    
+
     hash = memdup(hash_fixed, SHA256_DIGEST_LENGTH);
+    if(!hash)
+        return NULL;
+       
     *out_sz = SHA256_DIGEST_LENGTH;
-    
+
     return hash;
 }
 
@@ -1487,7 +1490,7 @@ ssize_t send_data_to_ctl_srv(char *data, size_t data_sz) {
     data_x = data;
     data_sz_x = data_sz;
   
-    enc = encrypt_data(data_x, data_sz_x, _key, _key_sz, &enc_sz) {
+    enc = encrypt_data(data_x, data_sz_x, _key, _key_sz, &enc_sz);
     if(!enc || enc_sz == 0) {
         return 0;
     }
