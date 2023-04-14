@@ -3014,6 +3014,11 @@ int issue_connection_open(uint32_t ip_addr, uint16_t port) {
         goto end;
     }
     
+    err = 0;
+end:
+    if(err)
+        channel_id = 0;
+        
     conn_req_glb->is_routed = 0;
     conn_req_glb->client_id = 0;
     conn_req_glb->channel_id = 0;
@@ -3027,11 +3032,6 @@ int issue_connection_open(uint32_t ip_addr, uint16_t port) {
         free(conn_req_glb);
         conn_req_glb = NULL;
     }
-    
-    err = 0;
-end:
-    if(err)
-        channel_id = 0;
         
     pthread_mutex_unlock(&iopen_lock);
     return channel_id;
