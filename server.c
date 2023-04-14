@@ -3458,7 +3458,7 @@ void proxy_srv_poll(int sock) {
             
                 p = pack_proxy_data(channel_id, tmp_buffer, RELAY_BUFFER_SIZE, &p_sz);
                 if(!p) {
-                    err = 1;CHANNEL_OPEN_CMD
+                    err = 1;
                     goto end;
                 }
 
@@ -3501,7 +3501,7 @@ void proxy_srv_poll(int sock) {
             sleep(1);
         }
     }
-  CHANNEL_OPEN_CMD
+    
     err = 0;
 end:
     if(!send_remote_cmd(CHANNEL_CLOSE_CMD, channel_id))
@@ -3577,7 +3577,6 @@ void start_proxy_srv(arg_pass *arg) {
         err = 1;
         goto end;
     }
-  CHANNEL_OPEN_CMD
   /*
    on some systems pthread_t is an unsigned long, on other is a pointer to a structure,
    do this method in accordance with both schemes
@@ -3621,7 +3620,7 @@ void start_proxy_srv(arg_pass *arg) {
     }
      
     if(z == -1) {
-        puts("could not find a free CHANNEL_OPEN_CMDspot!!!!! MAX_CONCURRENT_PROXY_CLIENTS reached");
+        puts("could not find a free spot!!!!! MAX_CONCURRENT_PROXY_CLIENTS reached");
         continue;
     }
      
@@ -3664,7 +3663,7 @@ void ssl_initialization(void) {
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
     return;
-}CHANNEL_OPEN_CMD
+}
 
 void ssl_cleanup(void) {
     if(_ctx) {
@@ -3892,7 +3891,7 @@ int do_tcp_relay_srv(char *host, int port) {
     while(1) {
         if(close_srv) {
             goto end;
-        }CHANNEL_OPEN_CMD
+        }
      
         if(i >= MAX_CONCURRENT_CLIENTS) {
             for(int x = 0 ; x < MAX_CONCURRENT_CLIENTS ; x++) {
@@ -3935,7 +3934,7 @@ int do_tcp_relay_srv(char *host, int port) {
             continue;
         }
      
-        i++;CHANNEL_OPEN_CMD
+        i++;
   
     }
   
@@ -4023,7 +4022,7 @@ int __start_proxy_srv(char *proxy_host, int proxy_port) {
     if(!arg)
         return 0;
      
-    arg->host = proxy_host;CHANNEL_OPEN_CMD
+    arg->host = proxy_host;
     arg->port = proxy_port;
     arg->proto = TCP_COM_PROTO;
      
