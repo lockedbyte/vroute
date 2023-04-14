@@ -38,6 +38,7 @@ $ gcc -o client client.c -lssl -lcrypto -lpthread
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <ctype.h>
+#include <stdarg.h>
 
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
@@ -55,6 +56,8 @@ $ gcc -o client client.c -lssl -lcrypto -lpthread
 #include "tp/base64.h"
 
 #define DEBUG 1
+
+#define VROUTE_VERSION "1.0.0"
 
 #define CHALLENGE_DEFAULT_SIZE 64
 
@@ -85,6 +88,27 @@ $ gcc -o client client.c -lssl -lcrypto -lpthread
 #define MAX_KEY_SIZE 64
 
 #define MAX_HOSTNAME_SIZE 255
+
+#if DEBUG
+
+#define VR_LOG(...) vr_log(__VA_ARGS__)
+
+#define MAX_LOG_MESSAGE_SIZE 4096
+#define LOG_PREFIX_STR "[VROUTE]"
+
+typedef enum {
+    UNKNOWN_LOG_LEVEL = 0,
+    LOG_WARN,
+    LOG_INFO,
+    LOG_DEBUG,
+    LOG_ERROR,
+} log_level_t;
+
+#else
+
+#define VR_LOG(ll, fmt, ...) ((void)0)
+
+#endif
 
 typedef enum {
     HTTPS_COM_PROTO = 0,
@@ -205,7 +229,7 @@ void ping_worker(void) {
         }
 
         if((curr_time - last_conn_time) > RELAY_TIMEOUT) {
-            printf("No response from server for %ld seconds. Restarting relay...\n", RELAY_TIMEOUT);
+            VR_LOG(LOG_ERROR, "No response from server for %ld seconds Restarting relay...", RELAY_TIMEOUT);
             pthread_exit(NULL);
         }
     }
@@ -218,6 +242,48 @@ void __ping_worker(void) {
     pthread_create(&th, NULL, ping_worker, NULL);
     return;
 }
+
+#if DEBUG
+
+void vr_log(log_level_t log_level, const char *format_str, ...) {
+    char message[MAX_LOG_MESSAGE_SIZE + 1] = { 0 };
+    char *log_level_prefix = NULL;
+    
+    if(!format_str)
+        return;
+    
+    if(log_level == UNKNOWN_LOG_LEVEL)
+        return;
+        
+    #if DEBUG
+    if(log_level == LOG_DEBUG)
+        return;
+    #endif
+        
+    if(log_level == LOG_WARN) {
+        log_level_prefix = "[WARN]";
+    } else if(log_level == LOG_INFO) {
+        log_level_prefix = "[INFO]";
+    } else if(log_level == LOG_DEBUG) {
+        log_level_prefix = "[DEBUG]";
+    } else if(log_level == LOG_ERROR) {
+        log_level_prefix = "[ERROR]";
+    } else
+        return;
+        
+    va_list args;
+    va_start(args, format_str);
+    
+    vsnprintf(message, MAX_LOG_MESSAGE_SIZE, format_str, args);
+    
+    va_end(args);
+    
+    printf("%s %s %s\n", LOG_PREFIX_STR, log_level_prefix, message);
+    
+    return;
+}
+
+#endif
 
 void init_openssl(void) {
     SSL_load_error_strings();
@@ -249,75 +315,6 @@ void shutdown_relay(void) {
     srv_down = 1;
     return;
 }
-
-/*
-ssize_t write_all(int sock, char **data, size_t *data_sz) {
-    int r = 0;
-    size_t sent = 0;
-    char *ptr = NULL;
-    size_t sz = 0;
-
-    if(sock < 0 || !data || !data_sz)
-        return -1;
-
-    if(data && data_sz) {
-        ptr = *data;
-        sz = *data_sz;
-    }
-
-    while(sent < sz) {
-        r = write(sock, ptr, sz - sent);
-        if(r < 0)
-           return -1;
-        sent += r;
-    }
-
-    return sent;
-}
-
-ssize_t read_all(int sock, char **data, size_t *data_sz) {
-    int bytes_available = 0;
-    size_t sent = 0;
-    int r = 0;
-    char *ptr = NULL;
-
-    if(sock < 0 || !data || !data_sz)
-        return -1;
-
-    *data = NULL;
-    *data_sz = 0;
-
-    #if WINDOWS_OS
-    r = ioctlsocket(sock, FIONREAD, &bytes_available);
-    #else
-    r = ioctl(sock, FIONREAD, &bytes_available);
-    #endif
-    if(r < 0)
-        return -1;
-
-    if(bytes_available < 0) {
-        *data = NULL;
-        *data_sz = 0;
-        return 0;
-    }
-
-    ptr = calloc(bytes_available + 1, sizeof(char));
-    if(!ptr)
-        return -1;
-
-    while(sent < bytes_available) {
-        r = read(sock, ptr, bytes_available - sent);
-        if(r < 0)
-            return -1;
-        sent += r;
-    }
-
-    *data = ptr;
-    *data_sz = bytes_available;
-
-    return sent;
-}
-*/
 
 ssize_t http_write_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is_https) {
     int r = 0;
@@ -448,367 +445,6 @@ void http_close(int sock, SSL *c_ssl, int is_https) {
 
     return;
 }
-
-/*
-void *memdup(const void *mem, size_t size) { 
-    void *out = calloc(size, sizeof(char));
-    if(out != NULL)
-        memcpy(out, mem, size);
-    return out;
-}
-
-char *generate_random_iv(size_t *out_sz) {
-    char *iv = NULL;
-    unsigned char c = 0;
-   
-    if(!out_sz)
-        return NULL;
-   
-    *out_sz = 0;
-   
-    iv = calloc(AES_IV_SIZE + 1, sizeof(char));
-    if(!iv)
-        return NULL;
-       
-    for(int i = 0 ; i < AES_IV_SIZE ; i++) {
-        c = (rand() % (MAX_IV_CHAR_RANGE - MIN_IV_CHAR_RANGE + 1)) + MIN_IV_CHAR_RANGE;
-        iv[i] = c;
-    }
-   
-    *out_sz = AES_IV_SIZE;
-
-    return iv;
-}
-
-size_t get_decrypted_size(char *enc, size_t enc_sz) {
-    size_t padding_size = enc[enc_sz - 1];
-    return enc_sz - padding_size;;
-}
-
-char *sha256_hash(char *data, size_t size, size_t *out_sz) {
-    char *hash = NULL;
-    unsigned char hash_fixed[SHA256_DIGEST_LENGTH + 1] = { 0 };
-
-    if(!data || size == 0 || !out_sz)
-        return NULL;
-
-    *out_sz = 0;
-
-    SHA256(data, size, hash_fixed);
-
-    hash = memdup(hash_fixed, SHA256_DIGEST_LENGTH);
-    if(!hash)
-        return NULL;
-       
-    *out_sz = SHA256_DIGEST_LENGTH;
-
-    return hash;
-}
-
-char *PKCS7_pad(char *data, size_t data_sz, int bs, size_t *out_size, int is_chall) {
-    EVP_CIPHER_CTX *ctx = NULL;
-    int padded_len = 0;
-    char *ptr = NULL;
-    
-    if(!data || data_sz == 0 || bs < 0 || !out_size || is_chall < 0)
-        return NULL;
-
-    *out_size = 0;
-
-    ptr = calloc(data_sz + bs, sizeof(char));
-    if(!ptr)
-        return NULL;
-    
-    ctx = EVP_CIPHER_CTX_new();
-    EVP_CIPHER_CTX_init(ctx);
-
-    if(is_chall)
-        EVP_EncryptInit_ex(ctx, EVP_aes_256_ecb(), NULL, NULL, NULL);
-    else
-        EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, NULL, NULL);
-
-    EVP_EncryptUpdate(ctx, ptr, &padded_len, data, data_sz);
-    EVP_EncryptFinal_ex(ctx, ptr + padded_len, &padded_len);
-
-    if(ctx) {
-        EVP_CIPHER_CTX_free(ctx);
-        ctx = NULL;
-    }
-    
-    *out_size = data_sz + bs - padded_len;
-
-    return ptr;
-}
-
-char *PKCS7_unpad(char *data, size_t data_sz, int bs, size_t *out_size, int is_chall) {
-    EVP_CIPHER_CTX *ctx = NULL;
-    int out_len = 0;
-    char *ptr = NULL;
-    
-    if(!data || data_sz == 0 || bs < 0 || !out_size || is_chall < 0)
-        return NULL;
-        
-    *out_size = 0;
-    
-    ptr = calloc(data_sz, sizeof(char));
-    if(!ptr)
-        return NULL;
-
-    ctx = EVP_CIPHER_CTX_new();
-    EVP_CIPHER_CTX_init(ctx);
-
-    if(is_chall)
-        EVP_DecryptInit_ex(ctx, EVP_aes_256_ecb(), NULL, NULL, NULL);
-    else
-        EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, NULL, NULL);
-
-    EVP_DecryptUpdate(ctx, ptr, &out_len, data, data_sz - bs);
-    EVP_DecryptFinal_ex(ctx, ptr + out_len, &out_len);
-
-    if(ctx) {
-        EVP_CIPHER_CTX_free(ctx);
-        ctx = NULL;
-    }
-    
-    *out_size = out_len;
-
-    return ptr;
-}
-
-char *encrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t *out_size) {
-    char *h_key = NULL;
-    size_t h_sz = 0;
-    AES_KEY aes_key;
-    size_t out_iv_sz = 0;
-    char *ciphertext = NULL;
-    size_t ciphertext_sz = 0;
-    char *padded = NULL;
-    size_t padded_size = 0;
-    char *iv = NULL;
-  
-    if(!data || data_sz == 0 || !key || key_sz == 0 || !out_size)
-        return NULL;
-    
-    *out_size = 0;
-  
-    h_key = sha256_hash(key, key_sz, &h_sz);
-    if(!h_key || h_sz == 0)
-        return NULL;
-      
-    AES_set_encrypt_key(h_key, 256, &aes_key);
-  
-    iv = generate_random_iv(&out_iv_sz);
-    if(!iv || out_iv_sz != AES_IV_SIZE) {
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-        return NULL;
-    }
-  
-    padded = PKCS7_pad(data, data_sz, AES_BLOCK_SIZE, &padded_size, 0);
-    if(!padded) {
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-
-        if(iv) {
-            free(iv);
-            iv = NULL;
-        }
-      
-        return NULL;
-    }
-  
-    ciphertext_sz = (padded_size / AES_BLOCK_SIZE + 1) * AES_BLOCK_SIZE;
-    ciphertext = calloc(AES_IV_SIZE + ciphertext_sz, sizeof(char));
-    if(!ciphertext) {
-        if(iv) {
-            free(iv);
-            iv = NULL;
-        }
-	  
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-	  
-        if(padded) {
-            free(padded);
-            padded = NULL;
-        }
-	  
-        return NULL;
-    }
-  
-    AES_cbc_encrypt(padded, ciphertext + AES_IV_SIZE, padded_size, &aes_key, iv, AES_ENCRYPT);
-  
-    if(iv) {
-        free(iv);
-        iv = NULL;
-    }
-  
-    if(h_key) {
-        free(h_key);
-        h_key = NULL;
-    }
-  
-    if(padded) {
-        free(padded);
-        padded = NULL;
-    }
-  
-    memcpy(ciphertext, iv, AES_IV_SIZE);
-  
-    *out_size = AES_IV_SIZE + ciphertext_sz;
-
-    return ciphertext;
-}
-
-char *decrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t *out_size) {
-    char *h_key = NULL;
-    size_t h_sz = 0;
-    AES_KEY aes_key;
-    char *iv = NULL;
-    char *cleartext = NULL;
-    size_t cleartext_sz = 0;
-    char *unpadded = NULL;
-    size_t unpadded_size = 0;
-  
-    if(!data || data_sz == 0 || data_sz <= AES_IV_SIZE || !key || key_sz == 0 || !out_size)
-        return NULL;
-    
-    *out_size = 0;
-  
-    cleartext_sz = get_decrypted_size(data + AES_IV_SIZE, data_sz - AES_IV_SIZE);
-    if(cleartext_sz == 0)
-        return NULL;
-
-    h_key = sha256_hash(key, key_sz, &h_sz);
-    if(!h_key || h_sz == 0)
-        return NULL;
-      
-    AES_set_encrypt_key(h_key, 256, &aes_key);
-  
-    iv = memdup(data, AES_IV_SIZE);
-    if(!iv) {
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-        return NULL;
-    }
-  
-    cleartext = calloc(cleartext_sz, sizeof(char));
-    if(!cleartext) {
-        if(iv) {
-            free(iv);
-            iv = NULL;
-        }
-	  
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-        return NULL;
-    }
-  
-    AES_cbc_encrypt(data + AES_IV_SIZE, cleartext, data_sz - AES_IV_SIZE, &aes_key, iv, AES_DECRYPT);
-  
-    if(iv) {
-        free(iv);
-        iv = NULL;
-    }
-  
-    if(h_key) {
-        free(h_key);
-        h_key = NULL;
-    }
-  
-    unpadded = PKCS7_unpad(cleartext, cleartext_sz, AES_BLOCK_SIZE, &unpadded_size, 0);
-    if(!unpadded) {
-        if(cleartext) {
-            free(cleartext);
-            cleartext = NULL;
-        }
-    }
-  
-    if(cleartext) {
-        free(cleartext);
-        cleartext = NULL;
-    }
-  
-    *out_size = unpadded_size;
-
-    return unpadded;
-}
-
-char *encrypt_challenge(char *data, size_t data_sz, char *key, size_t key_sz, size_t *out_size) {
-    char *h_key = NULL;
-    size_t h_sz = 0;
-    AES_KEY aes_key;
-    size_t out_iv_sz = 0;
-    char *ciphertext = NULL;
-    size_t ciphertext_sz = 0;
-    char *padded = NULL;
-    size_t padded_size = 0;
-  
-    if(!data || data_sz == 0 || !key || key_sz == 0 || !out_size)
-        return NULL;
-    
-    *out_size = 0;
-  
-    h_key = sha256_hash(key, key_sz, &h_sz);
-    if(!h_key || h_sz == 0)
-        return NULL;
-      
-    AES_set_encrypt_key(h_key, 256, &aes_key);
-  
-    padded = PKCS7_pad(data, data_sz, AES_BLOCK_SIZE, &padded_size, 1);
-    if(!padded) {
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-
-        return NULL;
-    }
-  
-    ciphertext_sz = (padded_size / AES_BLOCK_SIZE + 1) * AES_BLOCK_SIZE;
-    ciphertext = calloc(ciphertext_sz, sizeof(char));
-    if(!ciphertext) {
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-	  
-        if(padded) {
-            free(padded);
-            padded = NULL;
-        }
-  
-        return NULL;
-    }
-  
-    for(int i = 0 ; i < (padded_size / AES_BLOCK_SIZE) ; i++)
-        AES_ecb_encrypt(padded + (i * AES_BLOCK_SIZE), ciphertext + (i * AES_BLOCK_SIZE), &aes_key, AES_ENCRYPT);
-  
-    if(h_key) {
-        free(h_key);
-        h_key = NULL;
-    }
-  
-    if(padded) {
-        free(padded);
-        padded = NULL;
-    }
-  
-    *out_size = ciphertext_sz;
-
-    return ciphertext;
-}
-*/
 
 int open_http_conn(char *host, int port, int is_https, SSL **c_ssl) {
     SSL_CTX *ctx = NULL;
@@ -1272,7 +908,7 @@ int send_remote_cmd(scmd_t cmd, int channel_id) {
         case FORWARD_CONNECTION_FAILURE:
             break;
         default:
-            puts("Err.: command not found");
+            VR_LOG(LOG_ERROR, "Command not found");
             return 0;
     }
 
@@ -1578,7 +1214,7 @@ int interpret_remote_cmd(char *cmd, size_t cmd_sz) {
         return 1;
 
     } else {
-        puts("Unknown command received...");
+        VR_LOG(LOG_ERROR, "Unknown command received");
         return 0;
     }
 
@@ -1844,11 +1480,11 @@ void relay_poll(char *host, int port, proto_t proto) {
 
         retval = select(1, &rfds, &ofds, NULL, &tv);
         if(retval == -1) {
-            puts("select() error. Retrying...");
+            VR_LOG(LOG_ERROR, "Error at select(). Retrying...");
             pthread_mutex_unlock(&glb_conn_lock);
             continue;
         } else if(retval == 0) {
-            puts("No data. Looping...");
+            VR_LOG(LOG_ERROR, "No data. Looping...");
             pthread_mutex_unlock(&glb_conn_lock);
             continue;
         }
@@ -1868,7 +1504,7 @@ void relay_poll(char *host, int port, proto_t proto) {
                             pending_ch_array[x] = 0;
 
                             if(!send_remote_cmd(FORWARD_CONNECTION_SUCCESS, ch_id)) {
-                                puts("Error sending FORWARD_CONNECTION_SUCCESS");
+                                VR_LOG(LOG_ERROR, "Error sending FORWARD_CONNECTION_SUCCESS");
                                 pthread_mutex_unlock(&glb_conn_lock);
                                 return;
                             }
@@ -1878,11 +1514,11 @@ void relay_poll(char *host, int port, proto_t proto) {
                         }
 
                         if(errno == ECONNREFUSED || errno == ETIMEDOUT) {
-                            puts("Connection problems! Marking as: FORWARD_CONNECTION_FAILURE");
+                            VR_LOG(LOG_ERROR, "Connection problems! Marking as: FORWARD_CONNECTION_FAILURE");
                         }
 
                         if(!close_channel(ch_id)) {
-                            puts("Error closing channel");
+                            VR_LOG(LOG_ERROR, "Error closing channel");
                             pthread_mutex_unlock(&glb_conn_lock);
                             return;
                         }
@@ -1890,7 +1526,7 @@ void relay_poll(char *host, int port, proto_t proto) {
                         pending_ch_array[x] = 0;
 
                         if(!send_remote_cmd(FORWARD_CONNECTION_FAILURE, ch_id)) {
-                            puts("Error sending FORWARD_CONNECTION_FAILURE");
+                            VR_LOG(LOG_ERROR, "Error sending FORWARD_CONNECTION_FAILURE");
                             pthread_mutex_unlock(&glb_conn_lock);
                             return;
                         }
@@ -1902,7 +1538,7 @@ void relay_poll(char *host, int port, proto_t proto) {
                 pending_ch_array[x] = 0;
 
                 if(!send_remote_cmd(FORWARD_CONNECTION_SUCCESS, ch_id)) {
-                    puts("Error sending FORWARD_CONNECTION_SUCCESS");
+                    VR_LOG(LOG_ERROR, "Error sending FORWARD_CONNECTION_SUCCESS");
                     pthread_mutex_unlock(&glb_conn_lock);
                     return;
                 }
@@ -1918,7 +1554,7 @@ void relay_poll(char *host, int port, proto_t proto) {
                 if(fd_x != _ctl_sock) {
                     ch_id = get_channel_id_by_sock(fd_x);
                     if(ch_id <= 0) {
-                        puts("channel_id not found for sock");
+                        VR_LOG(LOG_ERROR, "Channel ID not found for sock");
                         pthread_mutex_unlock(&glb_conn_lock);
                         return;
                     }
@@ -1937,16 +1573,16 @@ void relay_poll(char *host, int port, proto_t proto) {
                             data_buf = NULL;
                         }
 
-                        puts("Error reading from channel");
+                        VR_LOG(LOG_ERROR, "Error reading from channel...");
 
                         if(!close_channel(ch_id)) {
-                            puts("Error closing channel");
+                            VR_LOG(LOG_ERROR, "Error closing channel");
                             pthread_mutex_unlock(&glb_conn_lock);
                             return;
                         }
 
                         if(!send_remote_cmd(FORWARD_CONNECTION_FAILURE, ch_id)) {
-                            puts("Error sending channel-closed cmd to server");
+                            VR_LOG(LOG_ERROR, "Error sending channel-closed cmd to server");
                             pthread_mutex_unlock(&glb_conn_lock);
                             return;
                         }
@@ -1982,32 +1618,32 @@ void relay_poll(char *host, int port, proto_t proto) {
 
     rx = ctl_recv_data(_ctl_sock, host, port, &enc, &enc_sz, proto);
     if(rx < 0) {
-        puts("Error reading from control server");
+        VR_LOG(LOG_ERROR, "Error reading from control server");
         pthread_mutex_unlock(&glb_conn_lock);
         return;
     }
     
     if(enc_sz == 0) {
-        puts("No data received from control server");
+        VR_LOG(LOG_ERROR, "No data received from control server");
         pthread_mutex_unlock(&glb_conn_lock);
         continue;
     }
     
     data_x = decrypt_data(enc, enc_sz, _key, _key_sz, &data_sz_x);
     if(!data_x) {
-        puts("decrypt err");
+        VR_LOG(LOG_ERROR, "Error decrypting data...");
         pthread_mutex_unlock(&glb_conn_lock);
         continue;
     }
 
     if(data_sz_x == 0) {
-        puts("No data received from control server (2)");
+        VR_LOG(LOG_ERROR, "No data received from control server");
         pthread_mutex_unlock(&glb_conn_lock);
         continue;
     }
 
     if(data_sz_x < sizeof(tlv_header)) {
-        puts("Error reading from control server");
+        VR_LOG(LOG_ERROR, "Error reading from control server ");
         pthread_mutex_unlock(&glb_conn_lock);
         return;
     }
@@ -2015,7 +1651,7 @@ void relay_poll(char *host, int port, proto_t proto) {
     memcpy(i_recv_buf, data_x, sizeof(tlv_header));
 
     if(recv_tlv->tlv_data_len > (data_sz_x - sizeof(tlv_header))) {
-        puts("Wrong tlv_header from control server");
+        VR_LOG(LOG_ERROR, "Wrong tlv_header from control server...");
         pthread_mutex_unlock(&glb_conn_lock);
         return;
     }
@@ -2039,7 +1675,7 @@ void relay_poll(char *host, int port, proto_t proto) {
     }
 
     if(data_sz_x != recv_tlv->tlv_data_len) {
-        puts("WARNING: Not all data received from server-side");
+        VR_LOG(LOG_WARN, "Not all data received from server side...");
     }
 
     if(recv_tlv->channel_id == COMMAND_CHANNEL) {
@@ -2049,7 +1685,7 @@ void relay_poll(char *host, int port, proto_t proto) {
                 data_buf = NULL;
             }
 
-            puts("error interpreting received command");
+            VR_LOG(LOG_ERROR, "Error interpreting received command");
             pthread_mutex_unlock(&glb_conn_lock);
             return; 
         }
@@ -2061,7 +1697,7 @@ void relay_poll(char *host, int port, proto_t proto) {
                 data_buf = NULL;
             }
 
-            puts("channel was not found!");
+            VR_LOG(LOG_ERROR, "Channel was not found");
             pthread_mutex_unlock(&glb_conn_lock);
             return;
         }
@@ -2072,7 +1708,7 @@ void relay_poll(char *host, int port, proto_t proto) {
                     data_buf = NULL;
                 }
 
-                puts("Error relaying data...");
+                VR_LOG(LOG_ERROR, "Error relaying data");
                 pthread_mutex_unlock(&glb_conn_lock);
                 return;
             }
@@ -2142,6 +1778,8 @@ int start_relay_conn(char *host, int port, proto_t proto, char *key, size_t key_
     char *data = NULL;
     size_t data_sz = 0;
     int consec_err = 0;
+    
+    VR_LOG(LOG_INFO, "Starting VROUTE client version '%s'...", VROUTE_VERSION);
 
     if(!host || port == 0 || !key || key_sz == 0)
         return 0;
@@ -2180,39 +1818,50 @@ int start_relay_conn(char *host, int port, proto_t proto, char *key, size_t key_
         }
     }
   
-    puts("Starting main loop...");
+    VR_LOG(LOG_INFO, "Starting main loop...");
+    
   
     consec_err = 0;
 
     while(1) {
         if(consec_err > 2) {
+            VR_LOG(LOG_ERROR, "Maximum connection tries reached. Aborting...");
             srv_down = 1;
             sleep(2);
         }
     
-        if(srv_down)
+        if(srv_down) {
+            VR_LOG(LOG_INFO, "Request to abort. Aborting...");
             return 0;
+        }
+            
+        VR_LOG(LOG_INFO, "Connecting to VROUTE relay server at: %s:%d...", host, port);
 
         if(proto == TCP_COM_PROTO) {
             ctl_sock = connect_ctl_srv(host, port);
             if(ctl_sock < 0) {
-                puts("Error connecting to server. Retrying...");
+                VR_LOG(LOG_ERROR, "Error connecting to server. Retrying...");
                 consec_err++;
                 sleep(10);
                 continue;
             }
         } else
             ctl_sock = MAGIC_DUMMY_FD;
+            
+        VR_LOG(LOG_DEBUG, "Starting VROUTE handshake with relay server...");
 
         // negotiate client_id with HTTP(S) or TCP
         if(!handshake(ctl_sock, host, port, proto, key, key_sz)) {
             close_wrp(ctl_sock);
             if(proto == HTTPS_COM_PROTO)
                 destroy_ssl();
+            VR_LOG(LOG_ERROR, "Error handshaking with server. Aborting...");
             return 0;
         }
 
-        printf("Connection succeeded with: %s:%d\n", host, port);
+        VR_LOG(LOG_INFO, "Connection succeed with: %s:%d", host, port);
+        
+        VR_LOG(LOG_DEBUG, "Initializing global definitions...");
 
         _host = strdup(host);
         _port = port;
@@ -2221,17 +1870,23 @@ int start_relay_conn(char *host, int port, proto_t proto, char *key, size_t key_
         _key = memdup(key, key_sz);
         _key_sz = key_sz;
 
-        puts("Starting ping worker...");
+        VR_LOG(LOG_INFO, "Starting ping worker...");
+        
         __ping_worker();
 
-        puts("Starting relay poll...");
+        VR_LOG(LOG_INFO, "Starting relay poll...");
+        
         relay_poll(host, port, proto);
 
-        if(srv_down)
+        if(srv_down) {
+            VR_LOG(LOG_INFO, "Request to abort. Aborting...");
             return 0;
+        }
 
         sleep(10);
     }
+    
+    VR_LOG(LOG_INFO, "Closing client...");
 
     if(proto == HTTPS_COM_PROTO)
         destroy_ssl();
@@ -2242,9 +1897,8 @@ int start_relay_conn(char *host, int port, proto_t proto, char *key, size_t key_
 #define PSK "p@ssw0rd_3241!!=#"
 
 int main(void) {
-    puts("Starting relay conn...");
-    if(!start_relay_conn("127.0.0.1", 9991, HTTPS_COM_PROTO, PSK, strlen(PSK))) {
-        puts("Unknown error occurred");
+    if(!start_relay_conn("127.0.0.1", 1337, HTTPS_COM_PROTO, PSK, strlen(PSK))) {
+        VR_LOG(LOG_ERROR, "Unknown error occurred");
         return 1;
     }
     return 0;

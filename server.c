@@ -40,6 +40,7 @@ $ gcc -o server server.c -lssl -lcrypto -lpthread
 #include <ctype.h>
 #include <sys/poll.h>
 #include <sys/ioctl.h>
+#include <stdarg.h>
 
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
@@ -58,9 +59,13 @@ $ gcc -o server server.c -lssl -lcrypto -lpthread
 
 #define DEBUG 1
 
+#define VROUTE_VERSION "1.0.0"
+
 #define CHALLENGE_DEFAULT_SIZE 64
 
 #define COMMAND_CHANNEL 0
+
+#define IN_ANY_ADDR "0.0.0.0"
 
 #define MAX_CONCURRENT_PROXY_CLIENTS 1024
 #define MAX_CONCURRENT_CLIENTS 1024
@@ -86,6 +91,11 @@ $ gcc -o server server.c -lssl -lcrypto -lpthread
 
 #define MIN_CHANNEL_ID 0x0000111111111111
 #define MAX_CHANNEL_ID 0x0000ffffffffffff
+
+#define VR_LOG(...) vr_log(__VA_ARGS__)
+
+#define MAX_LOG_MESSAGE_SIZE 4096
+#define LOG_PREFIX_STR "[VROUTE]"
 
 /*
 
@@ -286,6 +296,14 @@ typedef struct _conn_open_req {
     int client_id_arr[MAX_CONCURRENT_CLIENTS];
 } conn_open_req;
 
+typedef enum {
+    UNKNOWN_LOG_LEVEL = 0,
+    LOG_WARN,
+    LOG_INFO,
+    LOG_DEBUG,
+    LOG_ERROR,
+} log_level_t;
+
  cmd_def cmd_def_data[] = {
     [UNKNOWN_CMD] = {
         .cmd = UNKNOWN_CMD,
@@ -373,24 +391,43 @@ void shutdown_srv(void) {
     return;
 }
 
-/*
-int file_exists(const char *path) {
-    FILE *file = NULL;
-
-    if(!path)
-        return 0;
-
-    if((file = fopen(path, "r")) != NULL) {
-        if(file) {
-            fclose(file);
-            file = NULL;
-        }
-        return 1;
-    }
-
-    return 0;
+void vr_log(log_level_t log_level, const char *format_str, ...) {
+    char message[MAX_LOG_MESSAGE_SIZE + 1] = { 0 };
+    char *log_level_prefix = NULL;
+    
+    if(!format_str)
+        return;
+    
+    if(log_level == UNKNOWN_LOG_LEVEL)
+        return;
+        
+    #if DEBUG
+    if(log_level == LOG_DEBUG)
+        return;
+    #endif
+        
+    if(log_level == LOG_WARN) {
+        log_level_prefix = "[WARN]";
+    } else if(log_level == LOG_INFO) {
+        log_level_prefix = "[INFO]";
+    } else if(log_level == LOG_DEBUG) {
+        log_level_prefix = "[DEBUG]";
+    } else if(log_level == LOG_ERROR) {
+        log_level_prefix = "[ERROR]";
+    } else
+        return;
+        
+    va_list args;
+    va_start(args, format_str);
+    
+    vsnprintf(message, MAX_LOG_MESSAGE_SIZE, format_str, args);
+    
+    va_end(args);
+    
+    printf("%s %s %s\n", LOG_PREFIX_STR, log_level_prefix, message);
+    
+    return;
 }
-*/
 
 uint64_t generate_client_id(void) {
     uint64_t client_id = (rand() % (MAX_CLIENT_ID - MIN_CLIENT_ID + 1)) + MIN_CLIENT_ID;
@@ -433,75 +470,6 @@ int handshake_sess_exists(int h_id) {
     pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
-
-/*
-ssize_t write_all(int sock, char **data, size_t *data_sz) {
-    int r = 0;
-    size_t sent = 0;
-    char *ptr = NULL;
-    size_t sz = 0;
-
-    if(sock < 0 || !data || !data_sz)
-        return -1;
-
-    if(data && data_sz) {
-        ptr = *data;
-        sz = *data_sz;
-    }
-
-    while(sent < sz) {
-        r = write(sock, ptr, sz - sent);
-        if(r < 0)
-            return -1;
-        sent += r;
-    }
-
-    return sent;
-}
-
-ssize_t read_all(int sock, char **data, size_t *data_sz) {
-    int bytes_available = 0;
-    size_t sent = 0;
-    int r = 0;
-    char *ptr = NULL;
-
-    if(sock < 0 || !data || !data_sz)
-        return -1;
-
-    *data = NULL;
-    *data_sz = 0;
-
-    #if WINDOWS_OS
-    r = ioctlsocket(sock, FIONREAD, &bytes_available);
-    #else
-    r = ioctl(sock, FIONREAD, &bytes_available);
-    #endif
-    if(r < 0)
-        return -1;
-
-    if(bytes_available < 0) {
-        *data = NULL;
-        *data_sz = 0;
-        return 0;
-    }
-
-    ptr = calloc(bytes_available + 1, sizeof(char));
-    if(!ptr)
-        return -1;
-
-    while(sent < bytes_available) {
-        r = read(sock, ptr, bytes_available - sent);
-        if(r < 0)
-            return -1;
-        sent += r;
-    }
-
-    *data = ptr;
-    *data_sz = bytes_available;
-
-    return sent;
-}
-*/
 
 int is_challenge_solved(int h_id) {
     int idx = -1;
@@ -775,366 +743,6 @@ char *get_h_challenge_solution(int h_id, size_t *out_size) {
     *out_size = sol_size;
     return sol;
 }
-
-/*
-void *memdup(void *mem, size_t size) { 
-    void *out = calloc(size, sizeof(char));
-    if(out != NULL)
-        memcpy(out, mem, size);
-    return out;
-}
-
-char *generate_random_iv(size_t *out_sz) {
-    char *iv = NULL;
-    unsigned char c = 0;
-
-    if(!out_sz)
-        return NULL;
-
-    *out_sz = 0;
-
-    iv = calloc(AES_IV_SIZE + 1, sizeof(char));
-    if(!iv)
-        return NULL;
-
-    for(int i = 0 ; i < AES_IV_SIZE ; i++) {
-        c = (rand() % (MAX_IV_CHAR_RANGE - MIN_IV_CHAR_RANGE + 1)) + MIN_IV_CHAR_RANGE;
-        iv[i] = c;
-    }
-
-    *out_sz = AES_IV_SIZE;
-
-    return iv;
-}
-
-size_t get_decrypted_size(char *enc, size_t enc_sz) {
-    size_t padding_size = enc[enc_sz - 1];
-    return enc_sz - padding_size;;
-}
-
-char *sha256_hash(char *data, size_t size, size_t *out_sz) {
-    char *hash = NULL;
-    unsigned char hash_fixed[SHA256_DIGEST_LENGTH + 1] = { 0 };
-
-    if(!data || size == 0 || !out_sz)
-        return NULL;
-
-    *out_sz = 0;
-
-    SHA256(data, size, hash_fixed);
-
-    hash = memdup(hash_fixed, SHA256_DIGEST_LENGTH);
-    if(!hash)
-        return NULL;
-       
-    *out_sz = SHA256_DIGEST_LENGTH;
-
-    return hash;
-}
-
-char *PKCS7_pad(char *data, size_t data_sz, int bs, size_t *out_size, int is_chall) {
-    EVP_CIPHER_CTX *ctx = NULL;
-    int padded_len = 0;
-    char *ptr = NULL;
-    
-    if(!data || data_sz == 0 || bs < 0 || !out_size || is_chall < 0)
-        return NULL;
-
-    *out_size = 0;
-
-    ptr = calloc(data_sz + bs, sizeof(char));
-    if(!ptr)
-        return NULL;
-    
-    ctx = EVP_CIPHER_CTX_new();
-    EVP_CIPHER_CTX_init(ctx);
-
-    if(is_chall)
-        EVP_EncryptInit_ex(ctx, EVP_aes_256_ecb(), NULL, NULL, NULL);
-    else
-        EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, NULL, NULL);
-
-    EVP_EncryptUpdate(ctx, ptr, &padded_len, data, data_sz);
-    EVP_EncryptFinal_ex(ctx, ptr + padded_len, &padded_len);
-
-    if(ctx) {
-        EVP_CIPHER_CTX_free(ctx);
-        ctx = NULL;
-    }
-    
-    *out_size = data_sz + bs - padded_len;
-
-    return ptr;
-}
-
-char *PKCS7_unpad(char *data, size_t data_sz, int bs, size_t *out_size, int is_chall) {
-    EVP_CIPHER_CTX *ctx = NULL;
-    int out_len = 0;
-    char *ptr = NULL;
-    
-    if(!data || data_sz == 0 || bs < 0 || !out_size || is_chall < 0)
-        return NULL;
-        
-    *out_size = 0;
-    
-    ptr = calloc(data_sz, sizeof(char));
-    if(!ptr)
-        return NULL;
-
-    ctx = EVP_CIPHER_CTX_new();
-    EVP_CIPHER_CTX_init(ctx);
-
-    if(is_chall)
-        EVP_DecryptInit_ex(ctx, EVP_aes_256_ecb(), NULL, NULL, NULL);
-    else
-        EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, NULL, NULL);
-
-    EVP_DecryptUpdate(ctx, ptr, &out_len, data, data_sz - bs);
-    EVP_DecryptFinal_ex(ctx, ptr + out_len, &out_len);
-
-    if(ctx) {
-        EVP_CIPHER_CTX_free(ctx);
-        ctx = NULL;
-    }
-    
-    *out_size = out_len;
-
-    return ptr;
-}
-
-char *encrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t *out_size) {
-    char *h_key = NULL;
-    size_t h_sz = 0;
-    AES_KEY aes_key;
-    size_t out_iv_sz = 0;
-    char *ciphertext = NULL;
-    size_t ciphertext_sz = 0;
-    char *padded = NULL;
-    size_t padded_size = 0;
-    char *iv = NULL;
-  
-    if(!data || data_sz == 0 || !key || key_sz == 0 || !out_size)
-        return NULL;
-    
-    *out_size = 0;
-  
-    h_key = sha256_hash(key, key_sz, &h_sz);
-    if(!h_key || h_sz == 0)
-        return NULL;
-      
-    AES_set_encrypt_key(h_key, 256, &aes_key);
-  
-    iv = generate_random_iv(&out_iv_sz);
-    if(!iv || out_iv_sz != AES_IV_SIZE) {
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-        return NULL;
-    }
-  
-    padded = PKCS7_pad(data, data_sz, AES_BLOCK_SIZE, &padded_size, 0);
-    if(!padded) {
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-
-        if(iv) {
-            free(iv);
-            iv = NULL;
-        }
-
-        return NULL;
-    }
-
-    ciphertext_sz = (padded_size / AES_BLOCK_SIZE + 1) * AES_BLOCK_SIZE;
-    ciphertext = calloc(AES_IV_SIZE + ciphertext_sz, sizeof(char));
-    if(!ciphertext) {
-        if(iv) {
-            free(iv);
-            iv = NULL;
-        }
-
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-
-        if(padded) {
-            free(padded);
-            padded = NULL;
-        }
-
-        return NULL;
-    }
-
-    AES_cbc_encrypt(padded, ciphertext + AES_IV_SIZE, padded_size, &aes_key, iv, AES_ENCRYPT);
-  
-    if(iv) {
-        free(iv);
-        iv = NULL;
-    }
-
-    if(h_key) {
-        free(h_key);
-        h_key = NULL;
-    }
-  
-    if(padded) {
-        free(padded);
-        padded = NULL;
-    }
-
-    memcpy(ciphertext, iv, AES_IV_SIZE);
-  
-    *out_size = AES_IV_SIZE + ciphertext_sz;
-
-    return ciphertext;
-}
-
-char *decrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t *out_size) {
-    char *h_key = NULL;
-    size_t h_sz = 0;
-    AES_KEY aes_key;
-    char *iv = NULL;
-    char *cleartext = NULL;
-    size_t cleartext_sz = 0;
-      char *unpadded = NULL;
-    size_t unpadded_size = 0;
-  
-    if(!data || data_sz == 0 || data_sz <= AES_IV_SIZE || !key || key_sz == 0 || !out_size)
-        return NULL;
-    
-    *out_size = 0;
-  
-    cleartext_sz = get_decrypted_size(data + AES_IV_SIZE, data_sz - AES_IV_SIZE);
-    if(cleartext_sz == 0)
-        return NULL;
-
-    h_key = sha256_hash(key, key_sz, &h_sz);
-    if(!h_key || h_sz == 0)
-        return NULL;
-      
-    AES_set_encrypt_key(h_key, 256, &aes_key);
-  
-    iv = memdup(data, AES_IV_SIZE);
-    if(!iv) {
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-        return NULL;
-    }
-  
-    cleartext = calloc(cleartext_sz, sizeof(char));
-    if(!cleartext) {
-        if(iv) {
-            free(iv);
-            iv = NULL;
-        }
-
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-        return NULL;
-    }
-
-    AES_cbc_encrypt(data + AES_IV_SIZE, cleartext, data_sz - AES_IV_SIZE, &aes_key, iv, AES_DECRYPT);
-
-    if(iv) {
-        free(iv);
-        iv = NULL;
-    }
-
-    if(h_key) {
-        free(h_key);
-        h_key = NULL;
-    }
-
-    unpadded = PKCS7_unpad(cleartext, cleartext_sz, AES_BLOCK_SIZE, &unpadded_size, 0);
-    if(!unpadded) {
-        if(cleartext) {
-            free(cleartext);
-            cleartext = NULL;
-        }
-    }
-
-    if(cleartext) {
-        free(cleartext);
-        cleartext = NULL;
-    }
-
-    *out_size = unpadded_size;
-
-    return unpadded;
-}
-
-char *encrypt_challenge(char *data, size_t data_sz, char *key, size_t key_sz, size_t *out_size) {
-    char *h_key = NULL;
-    size_t h_sz = 0;
-    AES_KEY aes_key;
-    size_t out_iv_sz = 0;
-    char *ciphertext = NULL;
-    size_t ciphertext_sz = 0;
-    char *padded = NULL;
-    size_t padded_size = 0;
-  
-    if(!data || data_sz == 0 || !key || key_sz == 0 || !out_size)
-        return NULL;
-    
-    *out_size = 0;
-  
-    h_key = sha256_hash(key, key_sz, &h_sz);
-    if(!h_key || h_sz == 0)
-        return NULL;
-      
-    AES_set_encrypt_key(h_key, 256, &aes_key);
-  
-    padded = PKCS7_pad(data, data_sz, AES_BLOCK_SIZE, &padded_size, 1);
-    if(!padded) {
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-        return NULL;
-    }
-  
-    ciphertext_sz = (padded_size / AES_BLOCK_SIZE + 1) * AES_BLOCK_SIZE;
-    ciphertext = calloc(ciphertext_sz, sizeof(char));
-    if(!ciphertext) {
-        if(h_key) {
-            free(h_key);
-            h_key = NULL;
-        }
-
-        if(padded) {
-            free(padded);
-            padded = NULL;
-        }
-
-        return NULL;
-    }
-  
-    for(int i = 0 ; i < (padded_size / AES_BLOCK_SIZE) ; i++)
-        AES_ecb_encrypt(padded + (i * AES_BLOCK_SIZE), ciphertext + (i * AES_BLOCK_SIZE), &aes_key, AES_ENCRYPT);
-
-    if(h_key) {
-        free(h_key);
-        h_key = NULL;
-    }
-
-    if(padded) {
-        free(padded);
-        padded = NULL;
-    }
-
-    *out_size = ciphertext_sz;
-
-    return ciphertext;
-}
-*/
 
 int create_channel(int client_id, int proxy_sock, char *host, int port) {
     int c_idx = -1;
@@ -1818,7 +1426,7 @@ int queue_data(int client_id, char *data, size_t data_sz, time_t timestamp) {
         }
 
         if(p->next != NULL) {
-            puts("what tha fuck");
+            VR_LOG(LOG_ERROR, "Rare behaviour: p->next != NULL");
             pthread_mutex_unlock(&glb_structure_lock);
             return 0;
         }
@@ -2043,7 +1651,7 @@ int parse_socks_hdr(char *data, size_t data_sz, char **host, int **port) {
         return 0;
 
     if(inet_ntop(AF_INET, &s_hdr->dstip, host_string, INET_ADDRSTRLEN) == NULL) {
-        puts("err inet_ntop");
+        VR_LOG(LOG_ERROR, "Error in inet_ntop()");
         return 0;
     }
   
@@ -2769,26 +2377,6 @@ char *get_http_data_response(char *data, size_t data_sz, size_t *out_size) {
     return out;
 }
 
-/*
-  UNKNOWN_REQUEST_TYPE = 0,
-  HANDSHAKE_SESSION_TYPE,
-  DATA_REQUEST_TYPE,
-  DATA_SENDING_TYPE,
-*/
-
-/*
-
-typedef struct _conn_open_req {
-    int is_routed;
-    int channel_id;
-    int client_id;
-    uint32_t ip;
-    uint16_t port;
-    int client_id_arr[MAX_CONCURRENT_CLIENTS];
-} conn_open_req;
-
-*/
-
 int is_client_in_checked_list(int client_id) {
     int found = 0;
     
@@ -2835,7 +2423,7 @@ int mark_route_found(int client_id, int channel_id, int found) {
         }
 
         if(idx == -1) {
-            puts("no left space in conn_req_glb->client_id_arr...");
+            VR_LOG(LOG_ERROR, "No left space in conn_req_glb->client_id_arr...");
             pthread_mutex_unlock(&route_open_lock);
             return 0;
         }
@@ -2847,7 +2435,7 @@ int mark_route_found(int client_id, int channel_id, int found) {
     }
     
     if(conn_req_glb->channel_id != channel_id) {
-        puts("channel id does not coincide");
+        VR_LOG(LOG_ERROR, "Channel ID does NOT coincide (client provided vs global reference)");
         pthread_mutex_unlock(&route_open_lock);
         return 0;
     }
@@ -2876,17 +2464,6 @@ int is_route_discovery_in_process(void) {
     pthread_mutex_unlock(&route_open_lock);
     return 1; 
 }
-
-/*
-
-typedef struct __attribute__((packed)) _conn_cmd {
-    uint8_t cmd;
-    uint16_t channel_id;
-    uint32_t ip_addr;
-    uint16_t port;
-} conn_cmd;
-
-*/
 
 char *get_route_req_open_cmd(int client_id, size_t *out_size) {
     size_t osz = 0;
@@ -2950,7 +2527,7 @@ int issue_connection_open(uint32_t ip_addr, uint16_t port) {
     pthread_mutex_lock(&iopen_lock);
     
     if(conn_req_glb) {
-        puts("WEIRD! conn_req_glb not NULL");
+        VR_LOG(LOG_WARN, "conn_req_glb is not NULL and it should be...");
         free(conn_req_glb);
         conn_req_glb = NULL;
     }
@@ -3200,13 +2777,13 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
                 }
 		  
                 if(raw_sz == real_sol_sz && (memcmp(raw, real_sol, raw_sz) == 0)) {
-                    puts("right sol");
+                    VR_LOG(LOG_INFO, "Challenge solution provided by client is correct");
                     if(!mark_challenge_solved(h_id)) {
                         err = 1;
                         goto end;
                     }
                 } else {
-                    puts("wronng sol");
+                    VR_LOG(LOG_INFO, "Challenge solution provided by client is wrong");
                     if(!mark_challenge_failure(h_id)) {
                         err = 1;
                         goto end;
@@ -3399,7 +2976,8 @@ void proxy_srv_poll(int sock) {
         goto end;
     }
    
-    printf("target is blavbla %s:%d\n", rhost, rport);
+
+    VR_LOG(LOG_INFO, "Connection target is: %s:%d", rhost, rport);
 
     if(inet_pton(AF_INET, rhost, &ip_addr) == 0) {
         err = 1;
@@ -3555,7 +3133,7 @@ void start_proxy_srv(arg_pass *arg) {
      
     sfd = socket(AF_INET, SOCK_STREAM, 0);
     if(sfd < 0) {
-        puts("socket create fail");
+        VR_LOG(LOG_ERROR, "Error creating socket");
         err = 1;
         goto end;
     }
@@ -3567,13 +3145,13 @@ void start_proxy_srv(arg_pass *arg) {
     servaddr.sin_port = htons(proxy_port);
   
     if((bind(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
-        puts("socket bind failed...");
+        VR_LOG(LOG_ERROR, "Error binding socket");
         err = 1;
         goto end;
     }
   
     if((listen(sfd, MAX_CONCURRENT_PROXY_CLIENTS)) != 0) {
-        puts("Listen failed...");
+        VR_LOG(LOG_ERROR, "Error trying to listen on socket");
         err = 1;
         goto end;
     }
@@ -3596,7 +3174,7 @@ void start_proxy_srv(arg_pass *arg) {
                     tid[x] = 0;
                     i--;
                 } else {
-                    puts("err checking status");
+                    VR_LOG(LOG_ERROR, "Error checking thread status");
                     continue; /* err checking status */
                 }
             }
@@ -3606,11 +3184,11 @@ void start_proxy_srv(arg_pass *arg) {
      
     connfd = accept(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
     if(connfd < 0) {
-        puts("failed incoming conn");
+        VR_LOG(LOG_ERROR, "Failed accepting connection");
         continue;
     }
      
-    puts("client connected to proxy bla bla bla!!!11");
+    VR_LOG(LOG_INFO, "Client connected to SOCKS proxy server...");
      
     z = -1;
     while(z < MAX_CONCURRENT_PROXY_CLIENTS) {
@@ -3620,12 +3198,12 @@ void start_proxy_srv(arg_pass *arg) {
     }
      
     if(z == -1) {
-        puts("could not find a free spot!!!!! MAX_CONCURRENT_PROXY_CLIENTS reached");
+        VR_LOG(LOG_ERROR, "Could not find a free spot. MAX_CONCURRENT_PROXY_CLIENTS reached...");
         continue;
     }
      
     if(pthread_create(&tid[z], NULL, proxy_srv_poll, ((void *)connfd))) {
-        puts("thread creat fail");
+        VR_LOG(LOG_ERROR, "Error creating thread");
         continue;
     }
      
@@ -3638,7 +3216,7 @@ end:
     while(z < MAX_CONCURRENT_PROXY_CLIENTS) {
         res = pthread_cancel(tid[z]);
         if(res != 0) {
-            puts("err canceling thread");
+            VR_LOG(LOG_ERROR, "Error trying to cancel thread");
             continue;
         }
         z++;
@@ -3714,7 +3292,7 @@ int do_http_relay_srv(char *host, int port) {
      
     sfd = socket(AF_INET, SOCK_STREAM, 0);
     if(sfd < 0) {
-        puts("socket create fail");
+        VR_LOG(LOG_ERROR, "Socket creation failed");
         err = 1;
         goto end;
     }
@@ -3726,13 +3304,13 @@ int do_http_relay_srv(char *host, int port) {
     servaddr.sin_port = htons(port);
   
     if((bind(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
-        puts("socket bind failed...");
+        VR_LOG(LOG_ERROR, "Error trying to bind");
         err = 1;
         goto end;
     }
   
     if((listen(sfd, MAX_CONCURRENT_CLIENTS)) != 0) {
-        puts("Listen failed...");
+        VR_LOG(LOG_ERROR, "Error trying to listen");
         err = 1;
         goto end;
     }
@@ -3756,7 +3334,7 @@ int do_http_relay_srv(char *host, int port) {
                     tid[x] = 0;
                     i--;
                 } else {
-                    puts("err checking status");
+                    VR_LOG(LOG_ERROR, "Error checking thread status");
                     continue; /* err checking status */
                 }
             }
@@ -3766,7 +3344,7 @@ int do_http_relay_srv(char *host, int port) {
      
         connfd = accept(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
         if(connfd < 0) {
-            puts("failed incoming conn");
+            VR_LOG(LOG_ERROR, "Error accepting conenction");
             continue;
         }
      
@@ -3774,11 +3352,11 @@ int do_http_relay_srv(char *host, int port) {
         SSL_set_fd(c_ssl, connfd);
      
         if(SSL_accept(c_ssl) <= 0) {
-            puts("err ssl accept");
+            VR_LOG(LOG_ERROR, "Error accepting SSL connection");
             continue;
         }
 
-        puts("client connected to relay srv bla bla bla!!!11");
+        VR_LOG(LOG_INFO, "Client connected to relay server...");
      
         z = -1;
         while(z < MAX_CONCURRENT_CLIENTS) {
@@ -3788,7 +3366,7 @@ int do_http_relay_srv(char *host, int port) {
         }
      
         if(z == -1) {
-            puts("could not find a free spot!!!!! MAX_CONCURRENT_CLIENTS reached");
+            VR_LOG(LOG_ERROR, "Could not find a free spot. MAX_CONCURRENT_CLIENTS reached...");
             continue;
         }
      
@@ -3810,7 +3388,7 @@ int do_http_relay_srv(char *host, int port) {
         c_ssl = NULL;
      
         if(pthread_create(&tid[z], NULL, relay_http_srv_handle_req, ((void *)a_pass))) {
-            puts("thread creat fail");
+            VR_LOG(LOG_ERROR, "Error creating thread");
             continue;
         }
 
@@ -3828,7 +3406,7 @@ end:
     while(z < MAX_CONCURRENT_CLIENTS) {
         res = pthread_cancel(tid[z]);
         if(res != 0) {
-            puts("err canceling thread");
+            VR_LOG(LOG_ERROR, "Error trying to cancel thread");
             continue;
         }
         z++;
@@ -3860,7 +3438,7 @@ int do_tcp_relay_srv(char *host, int port) {
      
     sfd = socket(AF_INET, SOCK_STREAM, 0);
     if(sfd < 0) {
-        puts("socket create fail");
+        VR_LOG(LOG_ERROR, "Socket creation failed");
         err = 1;
         goto end;
     }
@@ -3872,13 +3450,13 @@ int do_tcp_relay_srv(char *host, int port) {
     servaddr.sin_port = htons(port);
   
     if((bind(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
-        puts("socket bind failed...");
+        VR_LOG(LOG_ERROR, "Failed when trying to bind");
         err = 1;
         goto end;
     }
   
     if((listen(sfd, MAX_CONCURRENT_CLIENTS)) != 0) {
-        puts("Listen failed...");
+        VR_LOG(LOG_ERROR, "Failed when trying to listen");
         err = 1;
         goto end;
     }
@@ -3902,7 +3480,7 @@ int do_tcp_relay_srv(char *host, int port) {
                     tid[x] = 0;
                     i--;
                 } else {
-                    puts("err checking status");
+                    VR_LOG(LOG_ERROR, "Error checking thread status...");
                     continue; /* err checking status */
                 }
             }
@@ -3911,11 +3489,11 @@ int do_tcp_relay_srv(char *host, int port) {
      
         connfd = accept(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
         if(connfd < 0) {
-            puts("failed incoming conn");
+            VR_LOG(LOG_ERROR, "Failed when accepting new connection");
             continue;
         }
 
-        puts("client connected to relay srv bla bla bla!!!11");
+        VR_LOG(LOG_INFO, "Client connected to relay server...");
 
         z = -1;
         while(z < MAX_CONCURRENT_CLIENTS) {
@@ -3925,12 +3503,12 @@ int do_tcp_relay_srv(char *host, int port) {
         }
      
         if(z == -1) {
-            puts("could not find a free spot!!!!! MAX_CONCURRENT_CLIENTS reached");
+            VR_LOG(LOG_ERROR, "Could not find a free spot. MAX_CONCURRENT_CLIENTS reached...");
             continue;
         }
 
         if(pthread_create(&tid[z], NULL, relay_tcp_srv_poll, ((void *)connfd))) {
-            puts("thread creat fail");
+            VR_LOG(LOG_ERROR, "Error creating thread");
             continue;
         }
      
@@ -3944,7 +3522,7 @@ end:
     while(z < MAX_CONCURRENT_CLIENTS) {
         res = pthread_cancel(tid[z]);
         if(res != 0) {
-            puts("err canceling thread");
+            VR_LOG(LOG_ERROR, "Error trying to cancel thread...");
             continue;
         }
         z++;
@@ -3985,7 +3563,7 @@ void start_relay_srv(arg_pass *arg) {
                 proto == HTTPS_COM_PROTO) {
             r = do_http_relay_srv(relay_host, relay_port);
     } else {
-        puts("unknown proto received");
+        VR_LOG(LOG_ERROR, "Unknown protocol received...");
         err = 1;
         goto end;
     }
@@ -4108,6 +3686,8 @@ proto:
 int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, int relay_port, proto_t proto, char *key, size_t key_sz, char *cert_file, int *err) {
     int fail = 0;
 
+    VR_LOG(LOG_INFO, "Starting VROUTE server version '%s'...", VROUTE_VERSION);
+
     if(!proxy_host || proxy_port <= 0) {
         fail = INVALID_PARAMETER;
         goto end;
@@ -4163,6 +3743,8 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
         fail = INVALID_PARAMETER;
         goto end;
     }
+    
+    VR_LOG(LOG_DEBUG, "Allocating and initializing proxy_client_conns...");
 
     if(!proxy_client_conns) {
         proxy_client_conns = (proxy_client_def *)calloc(MAX_CONCURRENT_PROXY_CLIENTS, sizeof(proxy_client_def));
@@ -4171,6 +3753,8 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
             goto end;
         }
     }
+    
+    VR_LOG(LOG_DEBUG, "Allocating and initializing client_conns...");
 
     if(!client_conns) {
         client_conns = (conn_def *)calloc(MAX_CONCURRENT_CLIENTS, sizeof(conn_def));
@@ -4179,6 +3763,8 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
             goto end;
         }
     }
+    
+    VR_LOG(LOG_DEBUG, "Allocating and initializing handshake_defs...");
   
     if(!handshake_defs) {
         handshake_defs = (http_handshake_def *)calloc(MAX_CONCURRENT_CLIENTS, sizeof(http_handshake_def));
@@ -4188,31 +3774,51 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
         }
     }
   
+    if(proto == HTTP_COM_PROTO)
+        VR_LOG(LOG_INFO, "Using protocol: HTTP_COM_PROTO");
+    else if(proto == HTTPS_COM_PROTO)
+        VR_LOG(LOG_INFO, "Using protocol: HTTPS_COM_PROTO");
+    else if(proto == TCP_COM_PROTO)
+        VR_LOG(LOG_INFO, "Using protocol: TCP_COM_PROTO");
+    
+    VR_LOG(LOG_DEBUG, "Allocating and initializing global definitions...");
+    
     _key = memdup(key, key_sz);
     _key_sz = key_sz;
     _proto = proto;
     _cert_file = strdup(cert_file);
+    
+    VR_LOG(LOG_INFO, "Starting SOCKS proxy server at: %s:%d...", IN_ANY_ADDR, proxy_port);
   
     if(!__start_proxy_srv(proxy_host, proxy_port)) {
         fail = SERVER_UNKNOWN_ERR;
         goto end;
     }
+    
+    VR_LOG(LOG_INFO, "Starting relay server at: %s:%d...", IN_ANY_ADDR, relay_port);
   
     if(!__start_relay_srv(relay_host, relay_port, proto)) {
         fail = SERVER_UNKNOWN_ERR;
         goto end;
     }
+    
+    VR_LOG(LOG_INFO, "Starting ping worker...");
   
     __ping_worker();
   
     while(1) {
         if(close_srv)
             break;
-        sleep(2);
+        sleep(4);
     }
 
     fail = 0;
 end:
+    if(fail)
+        VR_LOG(LOG_INFO, "Closing VROUTE server. Status: FAILURE");
+    else
+        VR_LOG(LOG_INFO, "Closing VROUTE server. Statur: NORMAL");
+    
     if(fail == 0) {
         if(err)
             *err = 0;
@@ -4222,8 +3828,11 @@ end:
         if(err)
             *err = fail;
     }
-  
+    
+    VR_LOG(LOG_DEBUG, "Closing all proxy clients...");
     close_all_proxy_clients();
+    
+    VR_LOG(LOG_DEBUG, "Closing all relay clients...");
     close_all_clients();
   
     if(proxy_client_conns) {
@@ -4271,7 +3880,7 @@ int main(void) {
     // note: NULL is allowed for &err arg
     // generate error codes and a translate-to-error-string table on socks4_rev_strerror() to get error information
     if(!start_socks4_rev_proxy("127.0.0.1", 1080, "127.0.0.1", 1337, TCP_COM_PROTO, PSK, strlen(PSK), "./cert.pem", &err)) {
-        printf("Error.: Server failed. (%d): %s\n", err, socks4_rev_strerror(err));
+        VR_LOG(LOG_ERROR, "Error.: Server failed. (%d): %s\n", err, socks4_rev_strerror(err));
         return 1;
     }
     return 0;
