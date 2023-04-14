@@ -2828,19 +2828,19 @@ int mark_route_found(int client_id, int channel_id, int found) {
     
     if(!found) {
         for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
-            if(conn_req_glb->client_ids[i] == 0) {
+            if(conn_req_glb->client_id_arr[i] == 0) {
                 idx = i;
                 break;
             }
         }
 
         if(idx == -1) {
-            puts("no left space in conn_req_glb->client_ids...");
+            puts("no left space in conn_req_glb->client_id_arr...");
             pthread_mutex_unlock(&route_open_lock);
             return 0;
         }
     
-        conn_req_glb->client_ids[idx] = client_id;
+        conn_req_glb->client_id_arr[idx] = client_id;
         
         pthread_mutex_unlock(&route_open_lock);
         return 1;
@@ -2911,14 +2911,14 @@ char *get_route_req_open_cmd(int client_id, size_t *out_size) {
         return 0;
     }
     
-    osz = sizeof(tlv_packet) + sizeof(conn_cmd);
+    osz = sizeof(tlv_header) + sizeof(conn_cmd);
     p = calloc(osz, sizeof(char));
     if(!p) {
         pthread_mutex_unlock(&route_open_lock);
         return NULL;
     }
     tlv = (tlv_header *)p;
-    c_cmd = (conn_cmd *)((char *)p + sizeof(tlv_packet));
+    c_cmd = (conn_cmd *)((char *)p + sizeof(tlv_header));
     
     tlv->client_id = client_id;
     tlv->channel_id = conn_req_glb->channel_id;
@@ -2964,7 +2964,7 @@ int issue_connection_open(uint32_t ip_addr, uint16_t port) {
     conn_req_glb->port = port;
     
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++)
-        conn_req_glb->client_ids[i] = 0;
+        conn_req_glb->client_id_arr[i] = 0;
     
     route_req_init_time = time(NULL);
     
@@ -3026,7 +3026,7 @@ end:
     conn_req_glb->port = 0;
     
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++)
-        conn_req_glb->client_ids[i] = 0;
+        conn_req_glb->client_id_arr[i] = 0;
         
     if(conn_req_glb) {
         free(conn_req_glb);
@@ -3122,7 +3122,7 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
         } else if(req_type == DATA_REQUEST_TYPE) {
             // TODO: should we add more locking here to ensure concurrency issues on multiple clients at once?
             
-            if(is_route_discovery_in_process() && !is_client_in_checked_list(client_id))
+            if(is_route_discovery_in_process() && !is_client_in_checked_list(cid))
                 qdata = get_route_req_open_cmd(cid, &qsize);    
             else
                 qdata = get_next_queued_data(cid, &qsize);
@@ -3566,7 +3566,7 @@ void start_proxy_srv(arg_pass *arg) {
     servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
     servaddr.sin_port = htons(proxy_port);
   
-    if((bind(sfd, (struct sockaddr *)&servaddr, sis_client_in_checked_listizeof(servaddr))) != 0) {
+    if((bind(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
         puts("socket bind failed...");
         err = 1;
         goto end;

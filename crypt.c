@@ -19,6 +19,8 @@
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 
+#include "util.h"
+
 #include "crypt.h"
 
 char *generate_random_iv(size_t *out_sz) {
