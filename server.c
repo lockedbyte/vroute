@@ -3,10 +3,7 @@
 TODO:
 - test
 - add logging
-- add locking
 - finish route discovery
-- create a crypt.c/crypt.h
-- create a util.c/util.h
 
 TO-CHECK:
 - compile with ASAN to detect memory corruption issues
@@ -55,6 +52,8 @@ $ gcc -o server server.c -lssl -lcrypto -lpthread
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 
+#include "util.h"
+#include "crypt.h"
 #include "tp/base64.h"
 
 #define DEBUG 1
@@ -69,6 +68,8 @@ $ gcc -o server server.c -lssl -lcrypto -lpthread
 #define MAX_CONCURRENT_QUEUED_BUFFERS MAX_CONCURRENT_CLIENTS * 256
 
 #define MAX_HOSTNAME_SIZE 255
+
+#define ROUTE_REQUEST_PROCESS_TIMEOUT 60 /* 1 minute */
 
 #define MAX_KEY_SIZE 64
 
@@ -86,10 +87,69 @@ $ gcc -o server server.c -lssl -lcrypto -lpthread
 #define MIN_CHANNEL_ID 0x0000111111111111
 #define MAX_CHANNEL_ID 0x0000ffffffffffff
 
+/*
+
+Source: https://www.openssh.com/txt/socks4.protocol
+
+1) CONNECT
+
+The client connects to the SOCKS server and sends a CONNECT request when
+it wants to establish a connection to an application server. The client
+includes in the request packet the IP address and the port number of the
+destination host, and userid, in the following format.
+
+		+----+----+----+----+----+----+----+----+----+----+....+----+
+		| VN | CD | DSTPORT |      DSTIP        | USERID       |NULL|
+		+----+----+----+----+----+----+----+----+----+----+....+----+
+ # of bytes:	   1    1      2              4           variable       1
+
+VN is the SOCKS protocol version number and should be 4. CD is the
+SOCKS command code and should be 1 for CONNECT request. NULL is a byte
+of all zero bits.
+
+The SOCKS server checks to see whether such a request should be granted
+based on any combination of source IP address, destination IP address,
+destination port number, the userid, and information it may obtain by
+consulting IDENT, cf. RFC 1413.  If the request is granted, the SOCKS
+server makes a connection to the specified port of the destination host.
+A reply packet is sent to the client when this connection is established,
+or when the request is rejected or the operation fails. 
+
+		+----+----+----+----+----+----+----+----+
+		| VN | CD | DSTPORT |      DSTIP        |
+		+----+----+----+----+----+----+----+----+
+ # of bytes:	   1    1      2              4
+
+VN is the version of the reply code and should be 0. CD is the result
+code with one of the following values:
+
+	90: request granted
+	91: request rejected or failed
+	92: request rejected becasue SOCKS server cannot connect to
+	    identd on the client
+	93: request rejected because the client program and identd
+	    report different user-ids
+
+The remaining fields are ignored.
+
+The SOCKS server closes its connection immediately after notifying
+the client of a failed or rejected request. For a successful request,
+the SOCKS server gets ready to relay traffic on both directions. This
+enables the client to do I/O on its connection as if it were directly
+connected to the application server.
+
+*/
+
+/* VN=0, CD=0x5a (success), dstport, dstip (ignored) */
+#define SOCKS_REPLY_SUCCESS "\x00\x5a\xff\xff\xff\xff\xff\xff"
+
+/* VN=0, CD=0x5b (failure / rejected), dstport, dstip (ignored) */
+#define SOCKS_REPLY_FAILURE "\x00\x5b\xff\xff\xff\xff\xff\xff"
+
 #define AES_IV_SIZE 16
 
-#define MIN_IV_CHAR_RANGE 0x1
-#define MAX_IV_CHAR_RANGE 0xff
+//#define MIN_IV_CHAR_RANGE 0x1
+//#define MAX_IV_CHAR_RANGE 0xff
 
 #define MIN_CHALL_CHR_VAL 0x01
 #define MAX_CHALL_CHR_VAL 0xff
@@ -217,6 +277,15 @@ typedef struct _cmd_def {
     char *name;
 } cmd_def;
 
+typedef struct _conn_open_req {
+    int is_routed;
+    int channel_id;
+    int client_id;
+    uint32_t ip;
+    uint16_t port;
+    int client_id_arr[MAX_CONCURRENT_CLIENTS];
+} conn_open_req;
+
  cmd_def cmd_def_data[] = {
     [UNKNOWN_CMD] = {
         .cmd = UNKNOWN_CMD,
@@ -263,6 +332,12 @@ buffer_queue *queue_head = NULL;
 
 http_handshake_def *handshake_defs = NULL;
 
+conn_open_req *conn_req_glb = NULL;
+
+pthread_mutex_t glb_structure_lock;
+pthread_mutex_t iopen_lock;
+pthread_mutex_t route_open_lock;
+
 char *_key = NULL;
 size_t _key_sz = 0;
 proto_t _proto = 0;
@@ -298,6 +373,7 @@ void shutdown_srv(void) {
     return;
 }
 
+/*
 int file_exists(const char *path) {
     FILE *file = NULL;
 
@@ -314,6 +390,7 @@ int file_exists(const char *path) {
 
     return 0;
 }
+*/
 
 uint64_t generate_client_id(void) {
     uint64_t client_id = (rand() % (MAX_CLIENT_ID - MIN_CLIENT_ID + 1)) + MIN_CLIENT_ID;
@@ -335,10 +412,11 @@ uint64_t generate_channel_id(void) {
 
 int handshake_sess_exists(int h_id) {
     int idx = -1;
-   // XXX: add locking
    
     if(h_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -348,12 +426,15 @@ int handshake_sess_exists(int h_id) {
     }
 
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
 
+    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
+/*
 ssize_t write_all(int sock, char **data, size_t *data_sz) {
     int r = 0;
     size_t sent = 0;
@@ -420,14 +501,16 @@ ssize_t read_all(int sock, char **data, size_t *data_sz) {
 
     return sent;
 }
+*/
 
 int is_challenge_solved(int h_id) {
     int idx = -1;
     int r = 0;
-   // XXX: add locking
    
     if(h_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -437,23 +520,28 @@ int is_challenge_solved(int h_id) {
     }
 
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
     r = handshake_defs[idx].is_solved;
-    if(r == 0)
+    if(r == 0) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
+    }
 
+    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
 int is_challenge_failure(int h_id) {
     int idx = -1;
     int r = 0;
-   // XXX: add locking
    
     if(h_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -463,22 +551,27 @@ int is_challenge_failure(int h_id) {
     }
 
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
 
     r = handshake_defs[idx].fail;
-    if(r == 0)
+    if(r == 0) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
+    }
 
+    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
 int mark_challenge_solved(int h_id) {
     int idx = -1;
-   // XXX: add locking
    
     if(h_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -488,20 +581,23 @@ int mark_challenge_solved(int h_id) {
     }
    
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
 
     handshake_defs[idx].is_solved = 1;
 
+    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
 int mark_challenge_failure(int h_id) {
     int idx = -1;
-   // XXX: add locking
    
     if(h_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -511,11 +607,13 @@ int mark_challenge_failure(int h_id) {
     }
    
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
 
     handshake_defs[idx].fail = 1;
 
+    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
@@ -526,10 +624,11 @@ int create_handshake(int h_id) {
     char *sol = NULL;
     size_t sol_size_a = 0;
     size_t sol_size = 0;
-   // XXX: add locking
 
     if(h_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == 0) {
@@ -539,6 +638,7 @@ int create_handshake(int h_id) {
     }
    
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
@@ -546,6 +646,7 @@ int create_handshake(int h_id) {
    
     sol_a = encrypt_challenge((char *)chall, CHALLENGE_DEFAULT_SIZE, _key, _key_sz, &sol_size_a);
     if(!sol_a) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
@@ -555,6 +656,7 @@ int create_handshake(int h_id) {
             free(sol_a);
             sol_a = NULL;
         }
+        pthread_mutex_unlock(&glb_structure_lock);
         return NULL;
     }
 
@@ -570,15 +672,17 @@ int create_handshake(int h_id) {
     handshake_defs[idx].is_solved = 0;
     handshake_defs[idx].fail = 0;
 
+    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
 int delete_handshake(int h_id) {
     int idx = -1;
-   // XXX: add locking
    
     if(h_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
    
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -588,6 +692,7 @@ int delete_handshake(int h_id) {
     }
    
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
@@ -607,16 +712,18 @@ int delete_handshake(int h_id) {
 
     handshake_defs[idx].sol_size = 0;
 
+    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
 char *get_challenge(int h_id) {
     int idx = -1;
     char *chall = NULL;
-   // XXX: add locking
    
     if(h_id < 0)
         return NULL;
+        
+    pthread_mutex_lock(&glb_structure_lock);
    
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -626,11 +733,13 @@ char *get_challenge(int h_id) {
     }
 
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return NULL;
     }
 
     chall = handshake_defs[idx].challenge;
 
+    pthread_mutex_unlock(&glb_structure_lock);
     return chall;
 }
 
@@ -638,12 +747,13 @@ char *get_h_challenge_solution(int h_id, size_t *out_size) {
     int idx = -1;
     char *sol = NULL;
     size_t sol_size = 0;
-   // XXX: add locking
    
     if(h_id < 0 || !out_size)
         return NULL;
 
     *out_size = 0;
+    
+    pthread_mutex_lock(&glb_structure_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -653,16 +763,20 @@ char *get_h_challenge_solution(int h_id, size_t *out_size) {
     }
 
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return NULL;
     }
 
     sol = handshake_defs[idx].solution;
     sol_size = handshake_defs[idx].sol_size;
 
+    pthread_mutex_unlock(&glb_structure_lock);
+    
     *out_size = sol_size;
     return sol;
 }
 
+/*
 void *memdup(void *mem, size_t size) { 
     void *out = calloc(size, sizeof(char));
     if(out != NULL)
@@ -1020,16 +1134,18 @@ char *encrypt_challenge(char *data, size_t data_sz, char *key, size_t key_sz, si
 
     return ciphertext;
 }
+*/
 
 int create_channel(int client_id, int proxy_sock, char *host, int port) {
     int c_idx = -1;
     int idx = -1;
     int channel_id = 0;
     int32_t dst_ip_addr = 0;
-   // XXX: add locking
    
     if(client_id < 0 || proxy_sock < 0 || !host || port <= 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(client_conns[i].client_id == client_id) {
@@ -1039,6 +1155,7 @@ int create_channel(int client_id, int proxy_sock, char *host, int port) {
     }
    
     if(c_idx = -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
@@ -1050,6 +1167,7 @@ int create_channel(int client_id, int proxy_sock, char *host, int port) {
     }
    
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
 
@@ -1066,16 +1184,64 @@ int create_channel(int client_id, int proxy_sock, char *host, int port) {
     client_conns[c_idx].c_channels[idx].dst_port = (int16_t)port;
     client_conns[c_idx].c_channels[idx].proxy_client_sock = proxy_sock;
 
+    pthread_mutex_unlock(&glb_structure_lock);
+    return channel_id;
+}
+
+int create_channel_custom(int channel_id, int client_id, int proxy_sock, char *host, int port) {
+    int c_idx = -1;
+    int idx = -1;
+    int32_t dst_ip_addr = 0;
+   
+    if(client_id < 0 || proxy_sock < 0 || !host || port <= 0)
+        return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
+
+    for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+        if(client_conns[i].client_id == client_id) {
+            c_idx = i;
+            break;
+        }
+    }
+   
+    if(c_idx = -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
+        return 0;
+    }
+   
+    for(int i = 0 ; i < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; i++) {
+        if(client_conns[c_idx].c_channels && client_conns[c_idx].c_channels[i].channel_id == 0) {
+            idx = i;
+            break;
+        }
+    }
+   
+    if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
+        return 0;
+    }
+
+    dst_ip_addr = inet_addr(host);
+
+    client_conns[c_idx].c_channels[idx].channel_id = channel_id;
+    client_conns[c_idx].c_channels[idx].client_id = client_id;
+    client_conns[c_idx].c_channels[idx].dst_ip_addr = dst_ip_addr;
+    client_conns[c_idx].c_channels[idx].dst_port = (int16_t)port;
+    client_conns[c_idx].c_channels[idx].proxy_client_sock = proxy_sock;
+
+    pthread_mutex_unlock(&glb_structure_lock);
     return channel_id;
 }
 
 int close_channel(int channel_id) {
     int idx = -1;
     int c_idx = -1;
-   // XXX: add locking
    
     if(channel_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
@@ -1088,6 +1254,7 @@ int close_channel(int channel_id) {
     }
    
     if(idx == -1 || c_idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
@@ -1101,19 +1268,23 @@ int close_channel(int channel_id) {
         client_conns[c_idx].c_channels[idx].proxy_client_sock = -1;
     }
    
-    if(!send_remote_cmd(CHANNEL_CLOSE_CMD, channel_id))
+    if(!send_remote_cmd(CHANNEL_CLOSE_CMD, channel_id)) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
+    }
   
+    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
 int channel_exists(int channel_id) {
     int idx = -1;
     int c_idx = -1;
-   // XXX: add locking
    
     if(channel_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
@@ -1126,9 +1297,11 @@ int channel_exists(int channel_id) {
     }
    
     if(idx == -1 || c_idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
+    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
@@ -1136,10 +1309,11 @@ int get_client_by_channel_id(int channel_id) {
     int idx = -1;
     int c_idx = -1;
     int client_id = 0;
-   // XXX: add locking
    
     if(channel_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
@@ -1152,11 +1326,13 @@ int get_client_by_channel_id(int channel_id) {
     }
    
     if(idx == -1 || c_idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
     client_id = client_conns[c_idx].c_channels[idx].client_id;
    
+    pthread_mutex_unlock(&glb_structure_lock);
     return client_id;
 }
 
@@ -1164,10 +1340,11 @@ int get_proxy_sock_by_channel_id(int channel_id) {
     int idx = -1;
     int c_idx = -1;
     int proxy_client_sock = 0;
-   // XXX: add locking
    
     if(channel_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
@@ -1180,11 +1357,13 @@ int get_proxy_sock_by_channel_id(int channel_id) {
     }
    
     if(idx == -1 || c_idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
     proxy_client_sock = client_conns[c_idx].c_channels[idx].proxy_client_sock;
-   
+    
+    pthread_mutex_unlock(&glb_structure_lock);
     return proxy_client_sock;
 }
 
@@ -1192,10 +1371,11 @@ int is_channel_by_client(int client_id, int channel_id) {
     int idx = -1;
     int c_idx = -1;
     int cid = 0;
-   // XXX: add locking
    
     if(client_id < 0 || channel_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
@@ -1208,20 +1388,24 @@ int is_channel_by_client(int client_id, int channel_id) {
     }
    
     if(idx == -1 || c_idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
     cid = client_conns[c_idx].c_channels[idx].client_id;
    
-    if(cid != client_id)
+    if(cid != client_id) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
+    }
    
+    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
+/* XXX: locking relies on caller! */
 int client_exists(int client_id) {
     int idx = -1;
-   // XXX: add locking
    
     if(client_id < 0)
         return 0;
@@ -1245,7 +1429,8 @@ int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
     int client_id = 0;
     int32_t client_ip_addr = 0;
     channel_def *c_channels = NULL;
-   // XXX; add locking
+   
+    pthread_mutex_lock(&glb_structure_lock);
    
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(client_conns[i].client_id == 0) {
@@ -1255,6 +1440,7 @@ int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
     }
    
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
   
@@ -1268,6 +1454,7 @@ int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
   
     c_channels = (channel_def *)calloc(MAX_CONCURRENT_CHANNELS_PER_CLIENT, sizeof(channel_def));
     if(!c_channels) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
   
@@ -1279,15 +1466,18 @@ int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
     client_conns[idx].orig_port = (int16_t)client_port;
     client_conns[idx].c_channels = c_channels;
 
+    pthread_mutex_unlock(&glb_structure_lock);
     return client_id;
 }
 
+/* XXX: locking relies on caller */
 int close_client(int client_id) {
     int idx = -1;
-  // XXX: add locking
   
     if(client_id < 0)
         return 0;
+        
+    //pthread_mutex_lock(&glb_structure_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(client_conns[i].client_id == client_id) {
@@ -1297,6 +1487,7 @@ int close_client(int client_id) {
     }
    
     if(idx == -1) {
+        //pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
@@ -1330,15 +1521,17 @@ int close_client(int client_id) {
         client_conns[idx].sock = -1;
     }
   
+    //pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
 int update_last_conn_time(int client_id) {
     int idx = -1;
-  // XXX: add locking
   
     if(client_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(client_conns[i].client_id == client_id) {
@@ -1348,11 +1541,13 @@ int update_last_conn_time(int client_id) {
     }
    
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
     client_conns[idx].last_conn_timestamp = time(NULL);
   
+    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
@@ -1374,12 +1569,14 @@ void close_all_proxy_clients(void) {
     return;
 }
 
+/* XXX: locking relies on caller */
 int proxy_client_exists(int proxy_client_id) {
     int idx = -1;
-   // XXX: add locking
    
     if(proxy_client_id < 0)
         return 0;
+        
+    //pthread_mutex_lock(&glb_structure_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
         if(proxy_client_conns[i].proxy_client_id == proxy_client_id) {
@@ -1388,9 +1585,12 @@ int proxy_client_exists(int proxy_client_id) {
         }
     }
    
-    if(idx == -1)
+    if(idx == -1) {
+        //pthread_mutex_unlock(&glb_structure_lock);
         return 0;
-      
+    }
+     
+    //pthread_mutex_unlock(&glb_structure_lock); 
     return 1;
 }
 
@@ -1398,10 +1598,11 @@ int create_proxy_client(int sock, char *client_ip, int client_port, int channel_
     int idx = -1;
     int proxy_client_id = 0;
     int32_t client_ip_addr = 0;
-   // XXX: add locking
 
     if(sock < 0 || channel_id <= 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
         if(proxy_client_conns[i].proxy_client_id == 0) {
@@ -1411,6 +1612,7 @@ int create_proxy_client(int sock, char *client_ip, int client_port, int channel_
     }
    
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
 
@@ -1428,15 +1630,17 @@ int create_proxy_client(int sock, char *client_ip, int client_port, int channel_
     proxy_client_conns[idx].orig_port = (int16_t)client_port;
     proxy_client_conns[idx].channel_id = channel_id;
 
+    pthread_mutex_unlock(&glb_structure_lock);
     return proxy_client_id;
 }
 
 int close_proxy_client(int proxy_client_id) {
     int idx = -1;
-  // XXX: add locking
   
     if(proxy_client_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
         if(proxy_client_conns[i].proxy_client_id == proxy_client_id) {
@@ -1446,6 +1650,7 @@ int close_proxy_client(int proxy_client_id) {
     }
    
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
 
@@ -1459,16 +1664,18 @@ int close_proxy_client(int proxy_client_id) {
         proxy_client_conns[idx].sock = -1;
     }
   
+    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
 int get_channel_by_proxy_client_id(int proxy_client_id) {
     int idx = -1;
     int channel_id = 0;
-  // XXX: add locking
   
     if(proxy_client_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
         if(proxy_client_conns[i].proxy_client_id == proxy_client_id) {
@@ -1478,21 +1685,24 @@ int get_channel_by_proxy_client_id(int proxy_client_id) {
     }
 
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
     channel_id = proxy_client_conns[idx].channel_id;
-   
+    
+    pthread_mutex_unlock(&glb_structure_lock);
     return channel_id;
 }
 
 int get_sock_by_proxy_client_id(int proxy_client_id) {
     int idx = -1;
     int sock = 0;
-  // XXX: add locking
 
     if(proxy_client_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
         if(proxy_client_conns[i].proxy_client_id == proxy_client_id) {
@@ -1502,21 +1712,24 @@ int get_sock_by_proxy_client_id(int proxy_client_id) {
     }
 
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
    
     sock = proxy_client_conns[idx].sock;
    
+    pthread_mutex_unlock(&glb_structure_lock);
     return sock;
 }
 
 int get_relay_sock_by_client_id(int client_id) {
     int idx = -1;
     int sock = 0;
-  // XXX: add locking
   
     if(client_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(client_conns[i].client_id == client_id) {
@@ -1526,21 +1739,25 @@ int get_relay_sock_by_client_id(int client_id) {
     }
 
     if(idx == -1) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
 
     sock = client_conns[idx].sock;
 
+    pthread_mutex_unlock(&glb_structure_lock);
     return sock;
 }
 
+/* XXX: locking relies on caller */
 int queue_exists(int queue_id) {
     buffer_queue *p = NULL;
     int found = 0;
-   // XXX: add locking
 
     if(queue_id < 0)
         return 0;
+        
+    //pthread_mutex_lock(&glb_structure_lock);
 
     p = queue_head;
     while(p) {
@@ -1552,9 +1769,11 @@ int queue_exists(int queue_id) {
     }
 
     if(!found) {
+        //pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
 
+    //pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
@@ -1563,10 +1782,11 @@ int queue_data(int client_id, char *data, size_t data_sz, time_t timestamp) {
     buffer_queue *qbuf = NULL;
     buffer_queue *p = NULL;
     char *qbuf_data = NULL;
-   // XXX: add locking
    
     if(client_id <= 0 || !data || data_sz == 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
       
     while(queue_id = generate_queue_id()) {
         if(!queue_exists(queue_id))
@@ -1574,8 +1794,10 @@ int queue_data(int client_id, char *data, size_t data_sz, time_t timestamp) {
     }
       
     qbuf = (buffer_queue *)calloc(sizeof(buffer_queue) + data_sz, sizeof(char));
-    if(!qbuf)
+    if(!qbuf) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
+    }
     qbuf_data = &qbuf->data[0];
 
     qbuf->queue_id = queue_id;
@@ -1597,12 +1819,14 @@ int queue_data(int client_id, char *data, size_t data_sz, time_t timestamp) {
 
         if(p->next != NULL) {
             puts("what tha fuck");
+            pthread_mutex_unlock(&glb_structure_lock);
             return 0;
         }
 
         p->next = qbuf;
     }
 
+    pthread_mutex_unlock(&glb_structure_lock);
     return queue_id;
 }
 
@@ -1612,10 +1836,11 @@ int remove_queued_data(int queue_id) {
     buffer_queue *p = NULL;
     buffer_queue *prev = NULL;
     int found = 0;
-   // XXX: add locking
    
     if(queue_id < 0)
         return 0;
+        
+    pthread_mutex_lock(&glb_structure_lock);
    
     prev = NULL;
     p = queue_head;
@@ -1628,8 +1853,10 @@ int remove_queued_data(int queue_id) {
         p = p->next;
     }
 
-    if(!found)
+    if(!found) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
+    }
 
     qbuf = p;
 
@@ -1653,7 +1880,8 @@ int remove_queued_data(int queue_id) {
         free(qbuf);
         qbuf = NULL;
     }
-
+    
+    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
@@ -1665,12 +1893,13 @@ char *get_queued_data(int queue_id, size_t *out_size) {
     buffer_queue *p = NULL;
     buffer_queue *prev = NULL;
     int found = 0;
-   // XXX: add locking
    
     if(queue_id < 0 || !out_size)
         return NULL;
      
     *out_size = 0;
+    
+    pthread_mutex_lock(&glb_structure_lock);
    
     prev = NULL;
     p = queue_head;
@@ -1683,8 +1912,10 @@ char *get_queued_data(int queue_id, size_t *out_size) {
         p = p->next;
     }
    
-    if(!found)
+    if(!found) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
+    }
       
     qbuf = p;
    
@@ -1697,8 +1928,10 @@ char *get_queued_data(int queue_id, size_t *out_size) {
     }
    
     out = memdup(qbuf_data, qbuf->size);
-    if(!out)
+    if(!out) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return NULL;
+    }
     data_size = qbuf->size;
    
     memset(qbuf_data, 0, qbuf->size);
@@ -1713,6 +1946,8 @@ char *get_queued_data(int queue_id, size_t *out_size) {
         free(qbuf);
         qbuf = NULL;
     }
+    
+    pthread_mutex_unlock(&glb_structure_lock);
   
     *out_size = data_size;
      
@@ -1727,12 +1962,13 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
     buffer_queue *p = NULL;
     buffer_queue *prev = NULL;
     int found = 0;
-    // XXX: add locking
    
     if(client_id < 0 || !out_size)
         return NULL;
      
     *out_size = 0;
+    
+    pthread_mutex_lock(&glb_structure_lock);
    
     prev = NULL;
     p = queue_head;
@@ -1745,8 +1981,10 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
         p = p->next;
     }
 
-    if(!found)
+    if(!found) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
+    }
       
     qbuf = p;
 
@@ -1759,8 +1997,10 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
     }
 
     out = memdup(qbuf_data, qbuf->size);
-    if(!out)
+    if(!out) {
+        pthread_mutex_unlock(&glb_structure_lock);
         return NULL;
+    }
     data_size = qbuf->size;
 
     memset(qbuf_data, 0, qbuf->size);
@@ -1775,15 +2015,13 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
         free(qbuf);
         qbuf = NULL;
     }
+    
+    pthread_mutex_unlock(&glb_structure_lock);
   
     *out_size = data_size;
      
     return out;
 }
-
-// TODO: prepare design and functions for route discovery process
-
-// +++++++++++++++++++++= funcs =++++++++++++++++++++++++++++++++++
 
 int parse_socks_hdr(char *data, size_t data_sz, char **host, int **port) {
     socks_hdr *s_hdr = NULL;
@@ -1816,10 +2054,11 @@ int parse_socks_hdr(char *data, size_t data_sz, char **host, int **port) {
 }
 
 void collect_dead_clients_worker(void) {
-    // XXX: add locking
     time_t last;
     time_t curr = time(NULL);
     long gap = 0;
+    
+    pthread_mutex_lock(&glb_structure_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(client_conns[i].client_id != 0 && (client_conns[i].proto == HTTP_COM_PROTO ||
@@ -1833,6 +2072,8 @@ void collect_dead_clients_worker(void) {
             }
         }
     }
+    
+    pthread_mutex_unlock(&glb_structure_lock);
    
     return;
 }
@@ -1854,7 +2095,7 @@ int send_remote_cmd(scmd_t cmd, int channel_id) {
         case RELAY_CLOSE_CMD:
         case PING_CMD:
             break;
-        case CHANNEL_OPEN_CMD:		/* issued independently */
+        case CHANNEL_OPEN_CMD:			/* issued independently */
         case FORWARD_CONNECTION_SUCCESS:	/* server-only command */
         case FORWARD_CONNECTION_FAILURE:	/* server-only command */
         case UNKNOWN_CMD:			/* unknown command */
@@ -1909,6 +2150,7 @@ int interpret_remote_packet(int client_id, char *data, size_t data_sz) {
     s_cmd *cmd_p = NULL;
     conn_cmd *cmp_p_x = NULL;
     uint8_t cmd = 0;
+    int found = 0;
   
     if(client_id < 0 || !data || data_sz == 0)
         return 0;
@@ -1955,15 +2197,24 @@ int interpret_remote_packet(int client_id, char *data, size_t data_sz) {
                     return 0;
                 return 1;
             }
-            case FORWARD_CONNECTION_SUCCESS: {
-                // TODO: implement route discovery thingy
-            }
-            case FORWARD_CONNECTION_FAILURE: {
-                // TODO: or do something for route discovery thingy
-                if(!close_channel(channel_id))
+            case FORWARD_CONNECTION_SUCCESS:
+                found = 1;
+            case FORWARD_CONNECTION_FAILURE:
+                if(channel_exists(channel_id)) {
+                    if(!found) {
+                        if(!close_channel(channel_id))
+                            return 0;
+                    }
                     return 0;
+                }
+                
+                if(is_client_in_checked_list(client_id))
+                    return 0;
+                
+                if(!mark_route_found(client_id, channel_id, found))
+                    return 0;
+                    
                 return 1;
-            }
             case UNKNOWN_CMD: 	/* unknown command */
             case CHANNEL_OPEN_CMD: /* client-only command */
             case RELAY_CLOSE_CMD: 	/* client-only command */
@@ -2525,6 +2776,267 @@ char *get_http_data_response(char *data, size_t data_sz, size_t *out_size) {
   DATA_SENDING_TYPE,
 */
 
+/*
+
+typedef struct _conn_open_req {
+    int is_routed;
+    int channel_id;
+    int client_id;
+    uint32_t ip;
+    uint16_t port;
+    int client_id_arr[MAX_CONCURRENT_CLIENTS];
+} conn_open_req;
+
+*/
+
+int is_client_in_checked_list(int client_id) {
+    int found = 0;
+    
+    if(client_id < 0)
+        return 0;
+        
+    pthread_mutex_lock(&route_open_lock);
+    
+    if(!conn_req_glb || conn_req_glb->is_routed == 1) {
+        pthread_mutex_unlock(&route_open_lock);
+        return 1; /* pretend its already there to prevent scanning */
+    }
+
+    for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+        if(conn_req_glb->client_id_arr[i] == client_id) {
+            found = 1;
+            break;
+        }
+    }
+    
+    pthread_mutex_unlock(&route_open_lock);
+    return found;
+}
+
+int mark_route_found(int client_id, int channel_id, int found) {
+    int idx = -1;
+    
+    if(client_id <= 0 || channel_id <= 0 || found < 0)
+        return 0;
+        
+    pthread_mutex_lock(&route_open_lock);
+
+    if(!conn_req_glb) {
+        pthread_mutex_unlock(&route_open_lock);
+        return 0;
+    }
+    
+    if(!found) {
+        for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+            if(conn_req_glb->client_ids[i] == 0) {
+                idx = i;
+                break;
+            }
+        }
+
+        if(idx == -1) {
+            puts("no left space in conn_req_glb->client_ids...");
+            pthread_mutex_unlock(&route_open_lock);
+            return 0;
+        }
+    
+        conn_req_glb->client_ids[idx] = client_id;
+        
+        pthread_mutex_unlock(&route_open_lock);
+        return 1;
+    }
+    
+    if(conn_req_glb->channel_id != channel_id) {
+        puts("channel id does not coincide");
+        pthread_mutex_unlock(&route_open_lock);
+        return 0;
+    }
+    
+    conn_req_glb->is_routed = 1;
+    conn_req_glb->client_id = client_id;
+    
+    pthread_mutex_unlock(&route_open_lock);
+    return 1;
+}
+
+int is_route_discovery_in_process(void) {
+
+    pthread_mutex_lock(&route_open_lock);
+    
+    if(!conn_req_glb || conn_req_glb->is_routed == 1) {
+        pthread_mutex_unlock(&route_open_lock);
+        return 0;
+    }
+    
+    if(conn_req_glb->ip != 0 && conn_req_glb->port != 0) {
+        pthread_mutex_unlock(&route_open_lock);
+        return 0;
+    }
+    
+    pthread_mutex_unlock(&route_open_lock);
+    return 1; 
+}
+
+/*
+
+typedef struct __attribute__((packed)) _conn_cmd {
+    uint8_t cmd;
+    uint16_t channel_id;
+    uint32_t ip_addr;
+    uint16_t port;
+} conn_cmd;
+
+*/
+
+char *get_route_req_open_cmd(int client_id, size_t *out_size) {
+    size_t osz = 0;
+    char *p = NULL;
+    tlv_header *tlv = NULL;
+    conn_cmd *c_cmd = NULL;
+    
+    if(client_id <= 0 || !out_size)
+        return 0;
+    
+    *out_size = 0;
+    
+    pthread_mutex_lock(&route_open_lock);
+    
+    if(!conn_req_glb || conn_req_glb->is_routed == 1) {
+        pthread_mutex_unlock(&route_open_lock);
+        return 0;
+    }
+    
+    if(conn_req_glb->ip != 0 && conn_req_glb->port != 0) {
+        pthread_mutex_unlock(&route_open_lock);
+        return 0;
+    }
+    
+    osz = sizeof(tlv_packet) + sizeof(conn_cmd);
+    p = calloc(osz, sizeof(char));
+    if(!p) {
+        pthread_mutex_unlock(&route_open_lock);
+        return NULL;
+    }
+    tlv = (tlv_header *)p;
+    c_cmd = (conn_cmd *)((char *)p + sizeof(tlv_packet));
+    
+    tlv->client_id = client_id;
+    tlv->channel_id = conn_req_glb->channel_id;
+    tlv->tlv_data_len = sizeof(conn_cmd);
+    
+    c_cmd->cmd = CHANNEL_OPEN_CMD;
+    c_cmd->channel_id = conn_req_glb->channel_id;
+    c_cmd->ip_addr = conn_req_glb->ip;
+    c_cmd->port = conn_req_glb->port;
+    
+    pthread_mutex_unlock(&route_open_lock);
+    
+    *out_size = osz;
+    return p; 
+}
+
+int issue_connection_open(uint32_t ip_addr, uint16_t port) {
+    int channel_id = 0;
+    int err = 0;
+    int success = 0;
+    int client_id = 0;
+    int c_id = 0;
+    char *host = NULL;
+    int proxy_sock = 0;
+    time_t route_req_init_time = 0;
+    time_t curr_time = 0;
+    struct in_addr i_addr;
+    
+    pthread_mutex_lock(&iopen_lock);
+    
+    if(conn_req_glb) {
+        puts("WEIRD! conn_req_glb not NULL");
+        free(conn_req_glb);
+        conn_req_glb = NULL;
+    }
+    
+    channel_id = generate_channel_id();
+    
+    conn_req_glb->is_routed = 0;
+    conn_req_glb->client_id = 0;
+    conn_req_glb->channel_id = channel_id; /* temporary channel_id */
+    conn_req_glb->ip = ip_addr;
+    conn_req_glb->port = port;
+    
+    for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++)
+        conn_req_glb->client_ids[i] = 0;
+    
+    route_req_init_time = time(NULL);
+    
+    while(1) {
+        curr_time = time(NULL);
+        
+        if((curr_time - route_req_init_time) >= ROUTE_REQUEST_PROCESS_TIMEOUT) {
+            success = 0;
+            break;
+        }
+        
+        pthread_mutex_lock(&route_open_lock);
+        
+        if(conn_req_glb->is_routed && conn_req_glb->client_id != 0) {
+            success = 1;
+            client_id = conn_req_glb->client_id;
+            pthread_mutex_unlock(&route_open_lock);
+            break;
+        }
+        
+        pthread_mutex_unlock(&route_open_lock);
+        
+        sleep(2);
+    }
+    
+    if(!success) {
+        err = 1;
+        goto end;
+    }
+    
+    i_addr.s_addr = ip_addr;
+    host = inet_ntoa(i_addr);
+    if(!host) {
+        err = 1;
+        goto end;
+    }
+    
+    proxy_sock = get_proxy_sock_by_channel_id(channel_id);
+    if(proxy_sock < 0) {
+        err = 1;
+        goto end;
+    }
+    
+    c_id = create_channel_custom(channel_id, client_id, proxy_sock, host, port);
+    if(c_id <= 0 || c_id != channel_id) {
+        err = 1;
+        goto end;
+    }
+    
+    conn_req_glb->is_routed = 0;
+    conn_req_glb->client_id = 0;
+    conn_req_glb->channel_id = 0;
+    conn_req_glb->ip = 0;
+    conn_req_glb->port = 0;
+    
+    for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++)
+        conn_req_glb->client_ids[i] = 0;
+        
+    if(conn_req_glb) {
+        free(conn_req_glb);
+        conn_req_glb = NULL;
+    }
+    
+    err = 0;
+end:
+    if(err)
+        channel_id = 0;
+        
+    pthread_mutex_unlock(&iopen_lock);
+    return channel_id;
+}
+
 char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
     char *p1 = NULL;
     char *p2 = NULL;
@@ -2608,10 +3120,13 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
             *out_size = 0;
             return NULL;
         } else if(req_type == DATA_REQUEST_TYPE) {
-            // TODO: [...]
-            //   check if we are in the process of route discovery, if so prorize it over queued buffers
-	   	   
-            qdata = get_next_queued_data(cid, &qsize);
+            // TODO: should we add more locking here to ensure concurrency issues on multiple clients at once?
+            
+            if(is_route_discovery_in_process() && !is_client_in_checked_list(client_id))
+                qdata = get_route_req_open_cmd(cid, &qsize);    
+            else
+                qdata = get_next_queued_data(cid, &qsize);
+
             if(!qdata || qsize == 0) {
                 *out_size = 0;
                 return NULL;
@@ -2853,6 +3368,10 @@ void proxy_srv_poll(int sock) {
     size_t p_sz = 0;
     int rsock = 0;
     ssize_t rx = 0;
+    int proxy_client_id = 0;
+    uint32_t ip_addr_i = 0;
+    uint16_t port = 0;
+    struct in_addr ip_addr;
    
     if(sock < 0) {
         err = 1;
@@ -2881,13 +3400,39 @@ void proxy_srv_poll(int sock) {
     }
    
     printf("target is blavbla %s:%d\n", rhost, rport);
-   
-    // TODO: channel_id = generate_channel_id(); // TODO: also check if it already exists
 
-    // TODO: issue CHANNEL_OPEN_CMD cmd iteratively ...
-  
-    // TODO: if we got one of the clients, pair client_id with channel_id and create the globally accessible data structures
-  
+    if(inet_pton(AF_INET, rhost, &ip_addr) == 0) {
+        err = 1;
+        goto end;
+    }
+    
+    ip_addr_i = ntohl(ip_addr.s_addr);
+    
+    port = (int16_t)rport;
+    
+    channel_id = issue_connection_open(ip_addr_i, port);
+    if(channel_id < 0) {
+        r = write(sock, SOCKS_REPLY_FAILURE, sizeof(SOCKS_REPLY_FAILURE));
+        if(r < 0) {
+           err = 1;
+           goto end;
+        }
+        err = 1;
+        goto end;
+    } else {
+        r = write(sock, SOCKS_REPLY_SUCCESS, sizeof(SOCKS_REPLY_FAILURE));
+        if(r < 0) {
+           err = 1;
+           goto end;
+        }
+    }
+
+    proxy_client_id = create_proxy_client(sock, NULL, 0, channel_id);
+    if(proxy_client_id < 0) {
+        err = 1;
+        goto end;
+    }
+    
     fds[0].fd = sock;
     fds[0].events = POLLIN;
   
@@ -2913,7 +3458,7 @@ void proxy_srv_poll(int sock) {
             
                 p = pack_proxy_data(channel_id, tmp_buffer, RELAY_BUFFER_SIZE, &p_sz);
                 if(!p) {
-                    err = 1;
+                    err = 1;CHANNEL_OPEN_CMD
                     goto end;
                 }
 
@@ -2956,13 +3501,25 @@ void proxy_srv_poll(int sock) {
             sleep(1);
         }
     }
-  
+  CHANNEL_OPEN_CMD
     err = 0;
 end:
+    if(!send_remote_cmd(CHANNEL_CLOSE_CMD, channel_id))
+        err = 1;
+    
+    if(proxy_client_id != 0)
+        close_proxy_client(proxy_client_id);
+    
     if(channel_id) {
         close_channel(channel_id);
         channel_id = 0;
     }
+    
+    if(sock != -1) {
+       close(sock);
+       sock = -1;
+    }
+    
     pthread_exit(NULL);
     return;
 }
@@ -3009,7 +3566,7 @@ void start_proxy_srv(arg_pass *arg) {
     servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
     servaddr.sin_port = htons(proxy_port);
   
-    if((bind(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
+    if((bind(sfd, (struct sockaddr *)&servaddr, sis_client_in_checked_listizeof(servaddr))) != 0) {
         puts("socket bind failed...");
         err = 1;
         goto end;
@@ -3020,7 +3577,7 @@ void start_proxy_srv(arg_pass *arg) {
         err = 1;
         goto end;
     }
-  
+  CHANNEL_OPEN_CMD
   /*
    on some systems pthread_t is an unsigned long, on other is a pointer to a structure,
    do this method in accordance with both schemes
@@ -3064,7 +3621,7 @@ void start_proxy_srv(arg_pass *arg) {
     }
      
     if(z == -1) {
-        puts("could not find a free spot!!!!! MAX_CONCURRENT_PROXY_CLIENTS reached");
+        puts("could not find a free CHANNEL_OPEN_CMDspot!!!!! MAX_CONCURRENT_PROXY_CLIENTS reached");
         continue;
     }
      
@@ -3107,7 +3664,7 @@ void ssl_initialization(void) {
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
     return;
-}
+}CHANNEL_OPEN_CMD
 
 void ssl_cleanup(void) {
     if(_ctx) {
@@ -3182,8 +3739,8 @@ int do_http_relay_srv(char *host, int port) {
     }
   
   /*
-   on some systems pthread_t is an unsigned long, on other is a pointer to a structure,
-   do this method in accordance with both schemes
+       on some systems pthread_t is an unsigned long, on other is a pointer to a structure,
+        do this method in accordance with both schemes
   */
     i = 0;
     while(1) {
@@ -3335,7 +3892,7 @@ int do_tcp_relay_srv(char *host, int port) {
     while(1) {
         if(close_srv) {
             goto end;
-        }
+        }CHANNEL_OPEN_CMD
      
         if(i >= MAX_CONCURRENT_CLIENTS) {
             for(int x = 0 ; x < MAX_CONCURRENT_CLIENTS ; x++) {
@@ -3378,7 +3935,7 @@ int do_tcp_relay_srv(char *host, int port) {
             continue;
         }
      
-        i++;
+        i++;CHANNEL_OPEN_CMD
   
     }
   
@@ -3466,7 +4023,7 @@ int __start_proxy_srv(char *proxy_host, int proxy_port) {
     if(!arg)
         return 0;
      
-    arg->host = proxy_host;
+    arg->host = proxy_host;CHANNEL_OPEN_CMD
     arg->port = proxy_port;
     arg->proto = TCP_COM_PROTO;
      
@@ -3689,7 +4246,6 @@ end:
 }
 
 char *socks4_rev_strerror(int err) {
-    // TODO
     char *str_err = NULL;
 
     switch(err) {
@@ -3707,12 +4263,6 @@ char *socks4_rev_strerror(int err) {
             break;
     }
     return str_err;
-}
-
-int start_socks4_rev_proxy_nb(char *proxy_host, int proxy_port, char *relay_host, int relay_port, proto_t proto, char *key, size_t key_sz, char *cert_file, int *err) {
-    // non-blocking version of start_socks4_rev_proxy()
-    // TODO
-    return 1;
 }
 
 #define PSK "p@ssw0rd_3241!!=#"

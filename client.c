@@ -5,8 +5,6 @@
 TODO:
 - test
 - add logging
-- create a crypt.c/crypt.h
-- create a util.c/util.h
 
 TO-CHECK:
 - compile with ASAN to detect memory corruption issues
@@ -52,6 +50,8 @@ $ gcc -o client client.c -lssl -lcrypto -lpthread
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 
+#include "util.h"
+#include "crypt.h"
 #include "tp/base64.h"
 
 #define DEBUG 1
@@ -250,6 +250,7 @@ void shutdown_relay(void) {
     return;
 }
 
+/*
 ssize_t write_all(int sock, char **data, size_t *data_sz) {
     int r = 0;
     size_t sent = 0;
@@ -316,6 +317,7 @@ ssize_t read_all(int sock, char **data, size_t *data_sz) {
 
     return sent;
 }
+*/
 
 ssize_t http_write_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is_https) {
     int r = 0;
@@ -447,6 +449,7 @@ void http_close(int sock, SSL *c_ssl, int is_https) {
     return;
 }
 
+/*
 void *memdup(const void *mem, size_t size) { 
     void *out = calloc(size, sizeof(char));
     if(out != NULL)
@@ -805,6 +808,7 @@ char *encrypt_challenge(char *data, size_t data_sz, char *key, size_t key_sz, si
 
     return ciphertext;
 }
+*/
 
 int open_http_conn(char *host, int port, int is_https, SSL **c_ssl) {
     SSL_CTX *ctx = NULL;
