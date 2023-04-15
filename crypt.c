@@ -23,6 +23,68 @@
 
 #include "crypt.h"
 
+#define DEBUG 1
+
+#if DEBUG
+
+#define VR_LOG(...) vr_log_c(__func__, __VA_ARGS__)
+#define hexdump(tag, mem, size) __hexdump(__func__, tag, mem, size)
+
+#define MAX_LOG_MESSAGE_SIZE 4096
+#define LOG_PREFIX_STR "[VROUTE]"
+
+typedef enum {
+    UNKNOWN_LOG_LEVEL = 0,
+    LOG_WARN,
+    LOG_INFO,
+    LOG_DEBUG,
+    LOG_ERROR,
+} log_level_t;
+
+#else
+
+#define VR_LOG(ll, fmt, ...) ((void)0)
+#define hexdump(tag, mem, size) ((void)0)
+
+#endif
+
+#if DEBUG
+
+void vr_log_c(const char *func_name, log_level_t log_level, const char *format_str, ...) {
+    char message[MAX_LOG_MESSAGE_SIZE + 1] = { 0 };
+    char *log_level_prefix = NULL;
+    
+    if(!func_name || !format_str)
+        return;
+    
+    if(log_level == UNKNOWN_LOG_LEVEL)
+        return;
+        
+    if(log_level == LOG_WARN) {
+        log_level_prefix = "[WARN]";
+    } else if(log_level == LOG_INFO) {
+        log_level_prefix = "[INFO]";
+    } else if(log_level == LOG_DEBUG) {
+        log_level_prefix = "[DEBUG]";
+    } else if(log_level == LOG_ERROR) {
+        log_level_prefix = "[ERROR]";
+    } else
+        return;
+        
+    va_list args;
+    va_start(args, format_str);
+    
+    vsnprintf(message, MAX_LOG_MESSAGE_SIZE, format_str, args);
+    
+    va_end(args);
+    
+    printf("%s %s %s: %s\n", LOG_PREFIX_STR, log_level_prefix, func_name, message);
+    
+    return;
+}
+
+#endif
+
 char *generate_random_iv(size_t *out_sz) {
     char *iv = NULL;
     unsigned char c = 0;
@@ -71,41 +133,52 @@ char *sha256_hash(char *data, size_t size, size_t *out_sz) {
     return hash;
 }
 
-char *PKCS7_pad(char *data, size_t data_sz, int bs, size_t *out_size, int is_chall) {
-    EVP_CIPHER_CTX *ctx = NULL;
-    int padded_len = 0;
-    char *ptr = NULL;
-    
-    if(!data || data_sz == 0 || bs < 0 || !out_size || is_chall < 0)
-        return NULL;
-
-    *out_size = 0;
-
-    ptr = calloc(data_sz + bs, sizeof(char));
-    if(!ptr)
-        return NULL;
-    
-    ctx = EVP_CIPHER_CTX_new();
-    EVP_CIPHER_CTX_init(ctx);
-
-    if(is_chall)
-        EVP_EncryptInit_ex(ctx, EVP_aes_256_ecb(), NULL, NULL, NULL);
-    else
-        EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, NULL, NULL);
-
-    EVP_EncryptUpdate(ctx, ptr, &padded_len, data, data_sz);
-    EVP_EncryptFinal_ex(ctx, ptr + padded_len, &padded_len);
-
-    if(ctx) {
-        EVP_CIPHER_CTX_free(ctx);
-        ctx = NULL;
+ char* PKCS7_pad( char *data, size_t data_size, int block_size, size_t *output_size) {
+    if (data_size == 0) {
+        *output_size = block_size;
+        return malloc(block_size);
     }
     
-    *out_size = data_sz + bs - padded_len;
-
-    return ptr;
+    size_t pad_size = block_size - (data_size % block_size);
+    *output_size = data_size + pad_size;
+    
+    unsigned char *output_data = malloc(*output_size);
+    memcpy(output_data, data, data_size);
+    memset(output_data + data_size, pad_size, pad_size);
+    
+    return output_data;
 }
 
+ char* PKCS7_unpad( char *data, size_t data_size, int block_size, size_t *output_size) {
+    if (data_size % block_size != 0 || data_size == 0) {
+        *output_size = 0;
+        VR_LOG(LOG_ERROR, "Error: data size not AES_BLOCK_SIZE-aligned for unpadding...");
+        return NULL;
+    }
+    
+    unsigned char pad_value = data[data_size - 1];
+    if (pad_value == 0 || pad_value > block_size) {
+        *output_size = 0;
+        VR_LOG(LOG_ERROR, "Last value for padding is wrong, corrupted data stream or non-padded data provided...");
+        return NULL;
+    }
+    
+    for (size_t i = data_size - pad_value ; i < data_size ; i++) {
+        if (data[i] != pad_value) {
+            *output_size = 0;
+            VR_LOG(LOG_ERROR, "Invalid pad value, corrupted data stream or non-padded data provided...");
+            return NULL;
+        }
+    }
+    
+    *output_size = data_size - pad_value;
+    unsigned char *output_data = malloc(*output_size);
+    memcpy(output_data, data, *output_size);
+    
+    return output_data;
+}
+
+#if 0
 char *PKCS7_unpad(char *data, size_t data_sz, int bs, size_t *out_size, int is_chall) {
     EVP_CIPHER_CTX *ctx = NULL;
     int out_len = 0;
@@ -140,6 +213,7 @@ char *PKCS7_unpad(char *data, size_t data_sz, int bs, size_t *out_size, int is_c
 
     return ptr;
 }
+#endif
 
 char *encrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t *out_size) {
     char *h_key = NULL;
@@ -151,6 +225,7 @@ char *encrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
     char *padded = NULL;
     size_t padded_size = 0;
     char *iv = NULL;
+    char *iv_bak = NULL;
   
     if(!data || data_sz == 0 || !key || key_sz == 0 || !out_size)
         return NULL;
@@ -158,8 +233,12 @@ char *encrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
     *out_size = 0;
   
     h_key = sha256_hash(key, key_sz, &h_sz);
-    if(!h_key || h_sz == 0)
+    if(!h_key || h_sz == 0) {
+        VR_LOG(LOG_ERROR, "Error trying to hash key with SHA-256");
         return NULL;
+    }
+    
+    hexdump("cleartext data", data, data_sz);
       
     AES_set_encrypt_key(h_key, 256, &aes_key);
   
@@ -169,10 +248,22 @@ char *encrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
             free(h_key);
             h_key = NULL;
         }
+        VR_LOG(LOG_ERROR, "Error generating random IV");
         return NULL;
     }
+    
+    iv_bak = memdup(iv, AES_IV_SIZE);
+    if(!iv_bak) {
+        if(h_key) {
+            free(h_key);
+            h_key = NULL;
+        }
+        return NULL;
+    }
+    
+    hexdump("AES CBC IV", iv, out_iv_sz);
   
-    padded = PKCS7_pad(data, data_sz, AES_BLOCK_SIZE, &padded_size, 0);
+    padded = PKCS7_pad(data, data_sz, AES_BLOCK_SIZE, &padded_size);
     if(!padded) {
         if(h_key) {
             free(h_key);
@@ -183,12 +274,19 @@ char *encrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
             free(iv);
             iv = NULL;
         }
-      
+        
+        if(iv_bak) {
+            free(iv_bak);
+            iv_bak = NULL;
+        }
+        VR_LOG(LOG_ERROR, "Error PKCS7-padding...");
         return NULL;
     }
+    
+    hexdump("padded data", padded, padded_size);
   
-    ciphertext_sz = (padded_size / AES_BLOCK_SIZE + 1) * AES_BLOCK_SIZE;
-    ciphertext = calloc(AES_IV_SIZE + ciphertext_sz, sizeof(char));
+    ciphertext_sz = padded_size; //(padded_size / AES_BLOCK_SIZE + 1) * AES_BLOCK_SIZE;
+    ciphertext = calloc(AES_IV_SIZE + padded_size, sizeof(char));
     if(!ciphertext) {
         if(iv) {
             free(iv);
@@ -204,11 +302,18 @@ char *encrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
             free(padded);
             padded = NULL;
         }
+        
+        if(iv_bak) {
+            free(iv_bak);
+            iv_bak = NULL;
+        }
 	  
         return NULL;
     }
   
-    AES_cbc_encrypt(padded, ciphertext + AES_IV_SIZE, padded_size, &aes_key, iv, AES_ENCRYPT);
+    AES_cbc_encrypt(padded, ciphertext + AES_IV_SIZE, padded_size, &aes_key, iv_bak, AES_ENCRYPT);
+    
+    memcpy(ciphertext, iv, AES_IV_SIZE);
   
     if(iv) {
         free(iv);
@@ -224,8 +329,13 @@ char *encrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
         free(padded);
         padded = NULL;
     }
-  
-    memcpy(ciphertext, iv, AES_IV_SIZE);
+    
+    if(iv_bak) {
+        free(iv_bak);
+        iv_bak = NULL;
+    }
+    
+    hexdump("encrypted data", ciphertext, AES_IV_SIZE + ciphertext_sz);
   
     *out_size = AES_IV_SIZE + ciphertext_sz;
 
@@ -246,16 +356,22 @@ char *decrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
         return NULL;
     
     *out_size = 0;
+    
+    hexdump("encrypted data", data, data_sz);
   
-    cleartext_sz = get_decrypted_size(data + AES_IV_SIZE, data_sz - AES_IV_SIZE);
-    if(cleartext_sz == 0)
+    cleartext_sz = data_sz; //get_decrypted_size(data + AES_IV_SIZE, data_sz - AES_IV_SIZE);
+   /* if(cleartext_sz == 0) {
+        VR_LOG(LOG_ERROR, "Error: cleartext size is 0");
         return NULL;
+    }*/
 
     h_key = sha256_hash(key, key_sz, &h_sz);
-    if(!h_key || h_sz == 0)
+    if(!h_key || h_sz == 0) {
+        VR_LOG(LOG_ERROR, "Error trying to hash key with SHA-256");
         return NULL;
+    }
       
-    AES_set_encrypt_key(h_key, 256, &aes_key);
+    AES_set_decrypt_key(h_key, 256, &aes_key);
   
     iv = memdup(data, AES_IV_SIZE);
     if(!iv) {
@@ -265,8 +381,10 @@ char *decrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
         }
         return NULL;
     }
+    
+    hexdump("AES CBC IV", iv, AES_IV_SIZE);
   
-    cleartext = calloc(cleartext_sz, sizeof(char));
+    cleartext = calloc(data_sz, sizeof(char));
     if(!cleartext) {
         if(iv) {
             free(iv);
@@ -291,14 +409,23 @@ char *decrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
         free(h_key);
         h_key = NULL;
     }
-  
-    unpadded = PKCS7_unpad(cleartext, cleartext_sz, AES_BLOCK_SIZE, &unpadded_size, 0);
+    
+    // XXX: make sure about this (TODO)
+    cleartext_sz = cleartext_sz - AES_BLOCK_SIZE;
+    
+    hexdump("padded data", cleartext, cleartext_sz);
+    
+    unpadded = PKCS7_unpad(cleartext, cleartext_sz, AES_BLOCK_SIZE, &unpadded_size);
     if(!unpadded) {
         if(cleartext) {
             free(cleartext);
             cleartext = NULL;
         }
+        VR_LOG(LOG_ERROR, "Error trying to PKCS7-unpad");
+        return NULL;
     }
+    
+    hexdump("unpadded data", unpadded, unpadded_size);
   
     if(cleartext) {
         free(cleartext);
@@ -326,20 +453,26 @@ char *encrypt_challenge(char *data, size_t data_sz, char *key, size_t key_sz, si
     *out_size = 0;
   
     h_key = sha256_hash(key, key_sz, &h_sz);
-    if(!h_key || h_sz == 0)
+    if(!h_key || h_sz == 0) {
+        VR_LOG(LOG_ERROR, "Error trying to hash key with SHA-256");
         return NULL;
+    }
       
     AES_set_encrypt_key(h_key, 256, &aes_key);
+    
+    hexdump("challenge", data, data_sz);
   
-    padded = PKCS7_pad(data, data_sz, AES_BLOCK_SIZE, &padded_size, 1);
+    padded = PKCS7_pad(data, data_sz, AES_BLOCK_SIZE, &padded_size);
     if(!padded) {
         if(h_key) {
             free(h_key);
             h_key = NULL;
         }
-
+        VR_LOG(LOG_ERROR, "Error when PKCS7-padding");
         return NULL;
     }
+    
+    hexdump("padded challenge", padded, padded_size);
   
     ciphertext_sz = (padded_size / AES_BLOCK_SIZE + 1) * AES_BLOCK_SIZE;
     ciphertext = calloc(ciphertext_sz, sizeof(char));
@@ -359,6 +492,8 @@ char *encrypt_challenge(char *data, size_t data_sz, char *key, size_t key_sz, si
   
     for(int i = 0 ; i < (padded_size / AES_BLOCK_SIZE) ; i++)
         AES_ecb_encrypt(padded + (i * AES_BLOCK_SIZE), ciphertext + (i * AES_BLOCK_SIZE), &aes_key, AES_ENCRYPT);
+        
+    hexdump("encrypted challenge", ciphertext, ciphertext_sz);
   
     if(h_key) {
         free(h_key);

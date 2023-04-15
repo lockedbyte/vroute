@@ -41,6 +41,7 @@ $ gcc -o server server.c -lssl -lcrypto -lpthread
 #include <sys/poll.h>
 #include <sys/ioctl.h>
 #include <stdarg.h>
+#include <errno.h>
 
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
@@ -65,6 +66,8 @@ $ gcc -o server server.c -lssl -lcrypto -lpthread
 
 #define COMMAND_CHANNEL 0
 
+#define POLL_TIMEOUT 2000
+
 #define IN_ANY_ADDR "0.0.0.0"
 
 #define MAX_CONCURRENT_PROXY_CLIENTS 1024
@@ -74,7 +77,7 @@ $ gcc -o server server.c -lssl -lcrypto -lpthread
 
 #define MAX_HOSTNAME_SIZE 255
 
-#define ROUTE_REQUEST_PROCESS_TIMEOUT 60 /* 1 minute */
+#define ROUTE_REQUEST_PROCESS_TIMEOUT 20 /* 10 seconds */
 
 #define MAX_KEY_SIZE 64
 
@@ -86,16 +89,24 @@ $ gcc -o server server.c -lssl -lcrypto -lpthread
 #define DATA_INPUT_PREFIX "token="
 #define DATA_INPUT_SUFFIX "; expire=0;"
 
-#define MIN_CLIENT_ID 0x0000111111111111
-#define MAX_CLIENT_ID 0x0000ffffffffffff
+#define MIN_CLIENT_ID 11111
+#define MAX_CLIENT_ID 60000
 
-#define MIN_CHANNEL_ID 0x0000111111111111
-#define MAX_CHANNEL_ID 0x0000ffffffffffff
+#define MIN_CHANNEL_ID 11111
+#define MAX_CHANNEL_ID 60000
 
-#define VR_LOG(...) vr_log(__VA_ARGS__)
+#define VR_LOG(...) vr_log(__func__, __VA_ARGS__)
+
+#if DEBUG
+#define hexdump(tag, mem, size) __hexdump(__func__, tag, mem, size)
+#else
+#define hexdump(tag, mem, size) ((void)0)
+#endif
 
 #define MAX_LOG_MESSAGE_SIZE 4096
 #define LOG_PREFIX_STR "[VROUTE]"
+
+char *get_route_req_open_cmd(int client_id, size_t *out_size);
 
 /*
 
@@ -259,7 +270,8 @@ typedef enum {
     RELAY_CLOSE_CMD,
     PING_CMD,
     FORWARD_CONNECTION_SUCCESS,
-    FORWARD_CONNECTION_FAILURE
+    FORWARD_CONNECTION_FAILURE,
+    CMD_DATA_LAST_NULL_ENTRY
 } scmd_t;
 
 typedef enum {
@@ -304,7 +316,7 @@ typedef enum {
     LOG_ERROR,
 } log_level_t;
 
- cmd_def cmd_def_data[] = {
+cmd_def cmd_def_data[] = {
     [UNKNOWN_CMD] = {
         .cmd = UNKNOWN_CMD,
         .value = 0,
@@ -339,6 +351,11 @@ typedef enum {
         .cmd = FORWARD_CONNECTION_FAILURE,
         .value = 0xff,
         .name = "FORWARD_CONNECTION_FAILURE"
+    },
+    [CMD_DATA_LAST_NULL_ENTRY] = {
+        .cmd = 0,
+        .value = 0,
+        .name = ""
     }
 };
 
@@ -363,6 +380,31 @@ char *_cert_file = NULL;
 
 SSL_CTX *_ctx = NULL;
 
+void collect_dead_clients_worker(void) {
+    time_t last;
+    time_t curr = time(NULL);
+    long gap = 0;
+    
+    pthread_mutex_lock(&glb_structure_lock);
+
+    for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+        if(client_conns[i].client_id != 0 && (client_conns[i].proto == HTTP_COM_PROTO ||
+                                    client_conns[i].proto == HTTPS_COM_PROTO)) {
+            last = client_conns[i].last_conn_timestamp;
+
+            gap = curr - last;
+
+            if(gap > LAST_CONN_GAP_THRESHOLD) {
+                close_client(client_conns[i].client_id);
+            }
+        }
+    }
+    
+    pthread_mutex_unlock(&glb_structure_lock);
+   
+    return;
+}
+
 void ping_worker(void) {
     long curr_time = 0;
     while(1) {
@@ -374,7 +416,6 @@ void ping_worker(void) {
         }
 
         collect_dead_clients_worker();
-    
     }
     pthread_exit(0);
     return;
@@ -391,17 +432,17 @@ void shutdown_srv(void) {
     return;
 }
 
-void vr_log(log_level_t log_level, const char *format_str, ...) {
+void vr_log(const char *func_name, log_level_t log_level, const char *format_str, ...) {
     char message[MAX_LOG_MESSAGE_SIZE + 1] = { 0 };
     char *log_level_prefix = NULL;
     
-    if(!format_str)
+    if(!func_name || !format_str)
         return;
     
     if(log_level == UNKNOWN_LOG_LEVEL)
         return;
         
-    #if DEBUG
+    #if !DEBUG
     if(log_level == LOG_DEBUG)
         return;
     #endif
@@ -424,7 +465,7 @@ void vr_log(log_level_t log_level, const char *format_str, ...) {
     
     va_end(args);
     
-    printf("%s %s %s\n", LOG_PREFIX_STR, log_level_prefix, message);
+    printf("%s %s %s: %s\n", LOG_PREFIX_STR, log_level_prefix, func_name, message);
     
     return;
 }
@@ -450,7 +491,7 @@ uint64_t generate_channel_id(void) {
 int handshake_sess_exists(int h_id) {
     int idx = -1;
    
-    if(h_id < 0)
+    if(h_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -463,6 +504,7 @@ int handshake_sess_exists(int h_id) {
     }
 
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -471,11 +513,21 @@ int handshake_sess_exists(int h_id) {
     return 1;
 }
 
+void generate_random_challenge(char *chall, size_t chall_sz) {
+    if(!chall || chall_sz == 0)
+        return;
+   
+    for(int i = 0 ; i < chall_sz ; i++)
+        chall[i] = (rand() % (MAX_CHALL_CHR_VAL - MIN_CHALL_CHR_VAL + 1)) + MIN_CHALL_CHR_VAL;
+   
+    return;
+}
+
 int is_challenge_solved(int h_id) {
     int idx = -1;
     int r = 0;
    
-    if(h_id < 0)
+    if(h_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -488,6 +540,7 @@ int is_challenge_solved(int h_id) {
     }
 
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -506,7 +559,7 @@ int is_challenge_failure(int h_id) {
     int idx = -1;
     int r = 0;
    
-    if(h_id < 0)
+    if(h_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -519,6 +572,7 @@ int is_challenge_failure(int h_id) {
     }
 
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -536,7 +590,7 @@ int is_challenge_failure(int h_id) {
 int mark_challenge_solved(int h_id) {
     int idx = -1;
    
-    if(h_id < 0)
+    if(h_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -549,6 +603,7 @@ int mark_challenge_solved(int h_id) {
     }
    
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -562,7 +617,7 @@ int mark_challenge_solved(int h_id) {
 int mark_challenge_failure(int h_id) {
     int idx = -1;
    
-    if(h_id < 0)
+    if(h_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -575,6 +630,7 @@ int mark_challenge_failure(int h_id) {
     }
    
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -593,7 +649,7 @@ int create_handshake(int h_id) {
     size_t sol_size_a = 0;
     size_t sol_size = 0;
 
-    if(h_id < 0)
+    if(h_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -606,6 +662,7 @@ int create_handshake(int h_id) {
     }
    
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find free slot for handshake definition");
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -614,6 +671,7 @@ int create_handshake(int h_id) {
    
     sol_a = encrypt_challenge((char *)chall, CHALLENGE_DEFAULT_SIZE, _key, _key_sz, &sol_size_a);
     if(!sol_a) {
+        VR_LOG(LOG_ERROR, "Error trying to encrypt generated challenge");
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -624,6 +682,7 @@ int create_handshake(int h_id) {
             free(sol_a);
             sol_a = NULL;
         }
+        VR_LOG(LOG_ERROR, "Error hashing solution in SHA-256");
         pthread_mutex_unlock(&glb_structure_lock);
         return NULL;
     }
@@ -647,7 +706,7 @@ int create_handshake(int h_id) {
 int delete_handshake(int h_id) {
     int idx = -1;
    
-    if(h_id < 0)
+    if(h_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -660,6 +719,7 @@ int delete_handshake(int h_id) {
     }
    
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -688,7 +748,7 @@ char *get_challenge(int h_id) {
     int idx = -1;
     char *chall = NULL;
    
-    if(h_id < 0)
+    if(h_id <= 0)
         return NULL;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -701,6 +761,7 @@ char *get_challenge(int h_id) {
     }
 
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return NULL;
     }
@@ -716,7 +777,7 @@ char *get_h_challenge_solution(int h_id, size_t *out_size) {
     char *sol = NULL;
     size_t sol_size = 0;
    
-    if(h_id < 0 || !out_size)
+    if(h_id <= 0 || !out_size)
         return NULL;
 
     *out_size = 0;
@@ -731,6 +792,7 @@ char *get_h_challenge_solution(int h_id, size_t *out_size) {
     }
 
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return NULL;
     }
@@ -750,7 +812,7 @@ int create_channel(int client_id, int proxy_sock, char *host, int port) {
     int channel_id = 0;
     int32_t dst_ip_addr = 0;
    
-    if(client_id < 0 || proxy_sock < 0 || !host || port <= 0)
+    if(client_id <= 0 || proxy_sock < 0 || !host || port <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -762,7 +824,8 @@ int create_channel(int client_id, int proxy_sock, char *host, int port) {
         }
     }
    
-    if(c_idx = -1) {
+    if(c_idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find client connection with client ID: %d", client_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -775,6 +838,7 @@ int create_channel(int client_id, int proxy_sock, char *host, int port) {
     }
    
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find free slot for channel definition");
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -801,7 +865,7 @@ int create_channel_custom(int channel_id, int client_id, int proxy_sock, char *h
     int idx = -1;
     int32_t dst_ip_addr = 0;
    
-    if(client_id < 0 || proxy_sock < 0 || !host || port <= 0)
+    if(client_id <= 0 || proxy_sock < 0 || !host || port <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -813,7 +877,8 @@ int create_channel_custom(int channel_id, int client_id, int proxy_sock, char *h
         }
     }
    
-    if(c_idx = -1) {
+    if(c_idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find client connection with client ID: %d", client_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -826,6 +891,7 @@ int create_channel_custom(int channel_id, int client_id, int proxy_sock, char *h
     }
    
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find free slot for channel definition");
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -842,12 +908,14 @@ int create_channel_custom(int channel_id, int client_id, int proxy_sock, char *h
     return channel_id;
 }
 
-int close_channel(int channel_id) {
+int close_channel(int channel_id, int is_client_req) {
     int idx = -1;
     int c_idx = -1;
    
-    if(channel_id < 0)
+    if(channel_id <= 0)
         return 0;
+        
+    puts("AAAAA");
         
     pthread_mutex_lock(&glb_structure_lock);
 
@@ -860,11 +928,16 @@ int close_channel(int channel_id) {
             }
         }
     }
+    
+    puts("bbbbbbbb");
    
     if(idx == -1 || c_idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find channel definition with channel ID: %d", channel_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
+    
+    puts("cccccccc");
    
     client_conns[c_idx].c_channels[idx].channel_id = 0;
     client_conns[c_idx].c_channels[idx].client_id = 0;
@@ -875,11 +948,18 @@ int close_channel(int channel_id) {
         close(client_conns[c_idx].c_channels[idx].proxy_client_sock);
         client_conns[c_idx].c_channels[idx].proxy_client_sock = -1;
     }
+    
+    puts("dddddddd");
    
-    if(!send_remote_cmd(CHANNEL_CLOSE_CMD, channel_id)) {
-        pthread_mutex_unlock(&glb_structure_lock);
-        return 0;
+    if(!is_client_req) {
+        if(!send_remote_cmd(CHANNEL_CLOSE_CMD, channel_id)) {
+            VR_LOG(LOG_ERROR, "Error sending remote cmd 'CHANNEL_CLOSE_CMD' to channel ID: %d", channel_id);
+            pthread_mutex_unlock(&glb_structure_lock);
+            return 0;
+        }
     }
+    
+    puts("eeeeee");
   
     pthread_mutex_unlock(&glb_structure_lock);
     return 1;
@@ -889,7 +969,7 @@ int channel_exists(int channel_id) {
     int idx = -1;
     int c_idx = -1;
    
-    if(channel_id < 0)
+    if(channel_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -918,7 +998,7 @@ int get_client_by_channel_id(int channel_id) {
     int c_idx = -1;
     int client_id = 0;
    
-    if(channel_id < 0)
+    if(channel_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -934,6 +1014,7 @@ int get_client_by_channel_id(int channel_id) {
     }
    
     if(idx == -1 || c_idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find channel definition with channel ID: %d", channel_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -949,7 +1030,7 @@ int get_proxy_sock_by_channel_id(int channel_id) {
     int c_idx = -1;
     int proxy_client_sock = 0;
    
-    if(channel_id < 0)
+    if(channel_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -965,6 +1046,7 @@ int get_proxy_sock_by_channel_id(int channel_id) {
     }
    
     if(idx == -1 || c_idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find channel definition with channel ID: %d", channel_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -980,7 +1062,7 @@ int is_channel_by_client(int client_id, int channel_id) {
     int c_idx = -1;
     int cid = 0;
    
-    if(client_id < 0 || channel_id < 0)
+    if(client_id <= 0 || channel_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -1015,7 +1097,7 @@ int is_channel_by_client(int client_id, int channel_id) {
 int client_exists(int client_id) {
     int idx = -1;
    
-    if(client_id < 0)
+    if(client_id <= 0)
         return 0;
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
@@ -1048,6 +1130,7 @@ int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
     }
    
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find client connection with client ID: %d", client_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -1082,7 +1165,7 @@ int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
 int close_client(int client_id) {
     int idx = -1;
   
-    if(client_id < 0)
+    if(client_id <= 0)
         return 0;
         
     //pthread_mutex_lock(&glb_structure_lock);
@@ -1095,6 +1178,7 @@ int close_client(int client_id) {
     }
    
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find client connection with client ID: %d", client_id);
         //pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -1125,7 +1209,7 @@ int close_client(int client_id) {
     }
    
     if(client_conns[idx].sock != -1) {
-        free(client_conns[idx].sock);
+        close(client_conns[idx].sock);
         client_conns[idx].sock = -1;
     }
   
@@ -1136,7 +1220,7 @@ int close_client(int client_id) {
 int update_last_conn_time(int client_id) {
     int idx = -1;
   
-    if(client_id < 0)
+    if(client_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -1149,6 +1233,7 @@ int update_last_conn_time(int client_id) {
     }
    
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find client connection with client ID: %d", client_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -1181,7 +1266,7 @@ void close_all_proxy_clients(void) {
 int proxy_client_exists(int proxy_client_id) {
     int idx = -1;
    
-    if(proxy_client_id < 0)
+    if(proxy_client_id <= 0)
         return 0;
         
     //pthread_mutex_lock(&glb_structure_lock);
@@ -1194,6 +1279,7 @@ int proxy_client_exists(int proxy_client_id) {
     }
    
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find proxy client connection with proxy client ID: %d", proxy_client_id);
         //pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -1220,6 +1306,7 @@ int create_proxy_client(int sock, char *client_ip, int client_port, int channel_
     }
    
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find free slot for proxy client connection");
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -1232,7 +1319,7 @@ int create_proxy_client(int sock, char *client_ip, int client_port, int channel_
     if(client_ip)
         client_ip_addr = inet_addr(client_ip);
    
-    proxy_client_conns[idx].proxy_client_id = 0;
+    proxy_client_conns[idx].proxy_client_id = proxy_client_id;
     proxy_client_conns[idx].sock = sock;
     proxy_client_conns[idx].client_ip_addr = client_ip_addr;
     proxy_client_conns[idx].orig_port = (int16_t)client_port;
@@ -1245,7 +1332,7 @@ int create_proxy_client(int sock, char *client_ip, int client_port, int channel_
 int close_proxy_client(int proxy_client_id) {
     int idx = -1;
   
-    if(proxy_client_id < 0)
+    if(proxy_client_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -1258,6 +1345,7 @@ int close_proxy_client(int proxy_client_id) {
     }
    
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find proxy client connection with proxy client ID: %d", proxy_client_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -1268,7 +1356,7 @@ int close_proxy_client(int proxy_client_id) {
     proxy_client_conns[idx].channel_id = 0;
    
     if(proxy_client_conns[idx].sock != -1) {
-        free(proxy_client_conns[idx].sock);
+        close(proxy_client_conns[idx].sock);
         proxy_client_conns[idx].sock = -1;
     }
   
@@ -1280,7 +1368,7 @@ int get_channel_by_proxy_client_id(int proxy_client_id) {
     int idx = -1;
     int channel_id = 0;
   
-    if(proxy_client_id < 0)
+    if(proxy_client_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -1293,6 +1381,7 @@ int get_channel_by_proxy_client_id(int proxy_client_id) {
     }
 
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find proxy client connection with proxy client ID: %d", proxy_client_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -1307,7 +1396,7 @@ int get_sock_by_proxy_client_id(int proxy_client_id) {
     int idx = -1;
     int sock = 0;
 
-    if(proxy_client_id < 0)
+    if(proxy_client_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -1320,6 +1409,7 @@ int get_sock_by_proxy_client_id(int proxy_client_id) {
     }
 
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find proxy client connection with proxy client ID: %d", proxy_client_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -1334,7 +1424,7 @@ int get_relay_sock_by_client_id(int client_id) {
     int idx = -1;
     int sock = 0;
   
-    if(client_id < 0)
+    if(client_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -1347,6 +1437,7 @@ int get_relay_sock_by_client_id(int client_id) {
     }
 
     if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find client connection with client ID: %d", client_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -1362,7 +1453,7 @@ int queue_exists(int queue_id) {
     buffer_queue *p = NULL;
     int found = 0;
 
-    if(queue_id < 0)
+    if(queue_id <= 0)
         return 0;
         
     //pthread_mutex_lock(&glb_structure_lock);
@@ -1445,7 +1536,7 @@ int remove_queued_data(int queue_id) {
     buffer_queue *prev = NULL;
     int found = 0;
    
-    if(queue_id < 0)
+    if(queue_id <= 0)
         return 0;
         
     pthread_mutex_lock(&glb_structure_lock);
@@ -1462,6 +1553,7 @@ int remove_queued_data(int queue_id) {
     }
 
     if(!found) {
+        VR_LOG(LOG_ERROR, "Could not find queued data with queue_id: %d", queue_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -1502,7 +1594,7 @@ char *get_queued_data(int queue_id, size_t *out_size) {
     buffer_queue *prev = NULL;
     int found = 0;
    
-    if(queue_id < 0 || !out_size)
+    if(queue_id <= 0 || !out_size)
         return NULL;
      
     *out_size = 0;
@@ -1521,6 +1613,7 @@ char *get_queued_data(int queue_id, size_t *out_size) {
     }
    
     if(!found) {
+        VR_LOG(LOG_INFO, "No queue_id (%d) found with data in queue", queue_id);
         pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
@@ -1571,7 +1664,7 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
     buffer_queue *prev = NULL;
     int found = 0;
    
-    if(client_id < 0 || !out_size)
+    if(client_id <= 0 || !out_size)
         return NULL;
      
     *out_size = 0;
@@ -1590,8 +1683,9 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
     }
 
     if(!found) {
+        VR_LOG(LOG_INFO, "No data for client ID (%d) in data queue", client_id);
         pthread_mutex_unlock(&glb_structure_lock);
-        return 0;
+        return NULL;
     }
       
     qbuf = p;
@@ -1631,9 +1725,10 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
     return out;
 }
 
-int parse_socks_hdr(char *data, size_t data_sz, char **host, int **port) {
+int parse_socks_hdr(char *data, size_t data_sz, char **host, int *port) {
     socks_hdr *s_hdr = NULL;
     char *host_string = NULL;
+    struct in_addr ip_struct;
   
     if(!data || data_sz == 0 || !host || !port)
         return 0;
@@ -1649,41 +1744,18 @@ int parse_socks_hdr(char *data, size_t data_sz, char **host, int **port) {
     host_string = calloc(INET_ADDRSTRLEN + 1, sizeof(char));
     if(!host_string)
         return 0;
+        
+    ip_struct.s_addr = s_hdr->dstip;
 
-    if(inet_ntop(AF_INET, &s_hdr->dstip, host_string, INET_ADDRSTRLEN) == NULL) {
+    if(inet_ntop(AF_INET, &ip_struct, host_string, INET_ADDRSTRLEN) == NULL) {
         VR_LOG(LOG_ERROR, "Error in inet_ntop()");
         return 0;
     }
   
     *host = host_string;
-    *port = s_hdr->dstport;
+    *port = ntohs(s_hdr->dstport);
 
     return 1;
-}
-
-void collect_dead_clients_worker(void) {
-    time_t last;
-    time_t curr = time(NULL);
-    long gap = 0;
-    
-    pthread_mutex_lock(&glb_structure_lock);
-
-    for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
-        if(client_conns[i].client_id != 0 && (client_conns[i].proto == HTTP_COM_PROTO ||
-                                    client_conns[i].proto == HTTPS_COM_PROTO)) {
-            last = client_conns[i].last_conn_timestamp;
-
-            gap = curr - last;
-
-            if(gap > LAST_CONN_GAP_THRESHOLD) {
-                close_client(client_conns[i].client_id);
-            }
-        }
-    }
-    
-    pthread_mutex_unlock(&glb_structure_lock);
-   
-    return;
 }
   
 int send_remote_cmd(scmd_t cmd, int channel_id) {
@@ -1694,8 +1766,10 @@ int send_remote_cmd(scmd_t cmd, int channel_id) {
     int client_id = 0;
     int rsock = 0;
     ssize_t rx = 0;
+    char *enc = NULL;
+    size_t enc_sz = 0;
   
-    if(channel_id < 0)
+    if(channel_id <= 0)
         return 0;
     
     switch(cmd) {
@@ -1719,28 +1793,56 @@ int send_remote_cmd(scmd_t cmd, int channel_id) {
     cmd_p = ((s_cmd *)(p + sizeof(tlv_header)));
 
     client_id = get_client_by_channel_id(channel_id);
-    if(client_id < 0)
+    if(client_id <= 0) {
+        VR_LOG(LOG_ERROR, "Error getting client ID by channel ID: %d", channel_id);
         return 0;
+    }
   
     tlv->client_id = client_id;
-    tlv->channel_id = channel_id;
+    tlv->channel_id = COMMAND_CHANNEL;
     tlv->tlv_data_len = sizeof(s_cmd);
   
-    cmd_p->cmd = cmd;
+    cmd_p->cmd = cmd_def_data[cmd].value;
     cmd_p->channel_id = channel_id;
+    
+    VR_LOG(LOG_INFO, "Sending command '%s'", cmd_def_data[cmd].name);
   
     if(_proto == TCP_COM_PROTO) {
         rsock = get_relay_sock_by_client_id(client_id);
-        if(rsock < 0)
+        if(rsock < 0) {
+            VR_LOG(LOG_ERROR, "Error getting relay sock by client ID: %d", client_id);
             return 0;
+        }
+        
+        enc = encrypt_data(p, p_sz, _key, _key_sz, &enc_sz);
+        if(!enc) {
+            VR_LOG(LOG_ERROR, "Error trying to encrypt data");
+            return 0;
+        }
 
-        rx = write_all(rsock, &p, &p_sz);
-        if(rx < 0)
+        rx = write_all(rsock, &enc, &enc_sz);
+        if(rx < 0) {
+            VR_LOG(LOG_ERROR, "Error writing to TCP relay clients");
             return 0;
+        }
+        
+        if(enc) {
+            free(enc);
+            enc = NULL;
+        }
     } else if(_proto == HTTP_COM_PROTO || 
                 _proto == HTTPS_COM_PROTO) {
-        if(!queue_data(client_id, p, p_sz, time(NULL)))
+        if(!queue_data(client_id, p, p_sz, time(NULL))) {
+            VR_LOG(LOG_ERROR, "Error trying to queue data");
             return 0;
+        }
+    }
+    
+    // XXX: fix p memory leaks on this function
+    
+    if(p) {
+        free(p);
+        p = NULL;  
     }
 
     return 1;
@@ -1759,8 +1861,9 @@ int interpret_remote_packet(int client_id, char *data, size_t data_sz) {
     conn_cmd *cmp_p_x = NULL;
     uint8_t cmd = 0;
     int found = 0;
+    int cmd_c = 0;
   
-    if(client_id < 0 || !data || data_sz == 0)
+    if(client_id <= 0 || !data || data_sz == 0)
         return 0;
   
     if(data_sz < sizeof(tlv_header))
@@ -1784,59 +1887,111 @@ int interpret_remote_packet(int client_id, char *data, size_t data_sz) {
     data_x = (data + sizeof(tlv_header));
     data_sz_x = tlv_sz;
   
-    if(cid == COMMAND_CHANNEL) {
+    if(channel_id == COMMAND_CHANNEL) {
         if(data_sz_x < sizeof(s_cmd))
             return 0;
+            
+        VR_LOG(LOG_INFO, "Received packet is a command");
   
         cmd_p = (s_cmd *)data_x;    
         cmd = cmd_p->cmd;
-      
-        if(channel_id != cmd_p->channel_id)
+        
+        for(int i = 0 ; i < CMD_DATA_LAST_NULL_ENTRY ; i++) {
+            if(cmd_def_data[i].value == cmd) {
+                found = 1;
+                cmd_c = i;
+                break;
+            }
+        }
+        
+        if(!found) {
+            VR_LOG(LOG_ERROR, "Unknown command received");
             return 0;
+        }
+        
+        found = 0;
       
-        switch(cmd) {
+      /*
+        if(channel_id != cmd_p->channel_id) {
+            VR_LOG(LOG_ERROR, "channel ID (%d) and channel ID in message (%d) do not coincide", channel_id, cmd_p->channel_id);
+            return 0;
+        }
+      */
+        switch(cmd_c) {
             case CHANNEL_CLOSE_CMD: {
-                if(!close_channel(channel_id))
+                VR_LOG(LOG_INFO, "Received a CHANNEL_CLOSE_CMD command");
+                
+                if(!close_channel(cmd_p->channel_id, 1)) {
+                    VR_LOG(LOG_ERROR, "Error trying to close channel ID: %ld", cmd_p->channel_id);
                     return 0;
+                }
                 return 1;
             }
             case PING_CMD: {
-                if(!update_last_conn_time(client_id))
+                VR_LOG(LOG_INFO, "Received a PING_CMD command");
+                
+                if(!update_last_conn_time(client_id)) {
+                    VR_LOG(LOG_ERROR, "Error updating last connetion time for client ID: %ld", client_id);
                     return 0;
+                }
                 return 1;
             }
             case FORWARD_CONNECTION_SUCCESS:
+                VR_LOG(LOG_INFO, "Received a FORWARD_CONNECTION_SUCCESS command");
                 found = 1;
             case FORWARD_CONNECTION_FAILURE:
-                if(channel_exists(channel_id)) {
+                if(!found)
+                    VR_LOG(LOG_INFO, "Received a FORWARD_CONNECTION_FAILURE command");
+                    
+                if(found) {
+                    VR_LOG(LOG_DEBUG, "Received FORWARD_CONNECTION_SUCCESS for channel_id: %d", cmd_p->channel_id);
+                } else {
+                    VR_LOG(LOG_DEBUG, "Received FORWARD_CONNECTION_FAILURE for channel_id: %d", cmd_p->channel_id);
+                }
+                
+                if(channel_exists(cmd_p->channel_id)) {
+                    VR_LOG(LOG_WARN, "Channel ID %d already exists", cmd_p->channel_id);
                     if(!found) {
-                        if(!close_channel(channel_id))
+                        if(!close_channel(cmd_p->channel_id, 1)) {
+                            VR_LOG(LOG_ERROR, "Error trying to close channel ID: %d", cmd_p->channel_id);
                             return 0;
+                        }
+                        return 1;
                     }
+                    VR_LOG(LOG_ERROR, "Channel already opened, we are not supposed to receive FORWARD_CONNECTION_SUCCESS messages");
                     return 0;
                 }
                 
-                if(is_client_in_checked_list(client_id))
-                    return 0;
+                if(is_client_in_checked_list(cmd_p->channel_id)) {
+                    VR_LOG(LOG_INFO, "This client has already been checked: No access to requested destination");
+                    return 1;
+                }
                 
-                if(!mark_route_found(client_id, channel_id, found))
+                if(!mark_route_found(client_id, cmd_p->channel_id, found)) {
+                    VR_LOG(LOG_ERROR, "Could not mark route as found");
                     return 0;
+                }
                     
                 return 1;
-            case UNKNOWN_CMD: 	/* unknown command */
+            case UNKNOWN_CMD:      /* unknown command */
             case CHANNEL_OPEN_CMD: /* client-only command */
-            case RELAY_CLOSE_CMD: 	/* client-only command */
+            case RELAY_CLOSE_CMD:  /* client-only command */
             default:
+                VR_LOG(LOG_ERROR, "Invalid command received");
                 return 0;
         }
     } else {
+        VR_LOG(LOG_INFO, "Received packet is data to relay to SOCKS proxy client");
+        
         proxy_sock = get_proxy_sock_by_channel_id(channel_id);
         if(proxy_sock < 0) {
+            VR_LOG(LOG_ERROR, "Error trying to get proxy client sock by channel ID: %d", channel_id);
             return 0;
         }
       
         rx = write_all(proxy_sock, &data_x, &data_sz_x);
         if(rx < 0) {
+            VR_LOG(LOG_ERROR, "Error writing data to corresponding proxy client");
             return 0;
         }
     }
@@ -1849,7 +2004,7 @@ char *pack_proxy_data(int channel_id, char *data, size_t size, size_t *out_size)
     tlv_header *tlv = NULL;
     char *p = NULL;
    
-    if(channel_id < 0 || !data || size == 0 || !out_size)
+    if(channel_id <= 0 || !data || size == 0 || !out_size)
         return NULL;
       
     *out_size = 0;
@@ -1860,8 +2015,10 @@ char *pack_proxy_data(int channel_id, char *data, size_t size, size_t *out_size)
     tlv = (tlv_header *)p;
    
     client_id = get_client_by_channel_id(channel_id);
-    if(client_id < 0)
+    if(client_id <= 0) {
+        VR_LOG(LOG_ERROR, "Error trying to get client ID by channel ID: %d", channel_id);
         return NULL;
+    }
    
     tlv->client_id = client_id;
     tlv->channel_id = channel_id;
@@ -1898,11 +2055,15 @@ char *get_challenge_solution(char *challenge, size_t size, size_t *out_size, cha
     *out_size = 0;
     
     ptr = encrypt_challenge(challenge, size, key, key_sz, &out_size_x);
-    if(!ptr)
+    if(!ptr) {
+        VR_LOG(LOG_ERROR, "Error trying to encrypt challenge");
         return NULL;
-        
-    if(out_size_x == 0)
+    }
+    
+    if(out_size_x == 0) {
+        VR_LOG(LOG_ERROR, "Error: Encrypted challenge size is 0");
         return NULL;
+    }
         
     sol = sha256_hash(ptr, out_size_x, &s_out_size);
     if(!sol) {
@@ -1910,6 +2071,7 @@ char *get_challenge_solution(char *challenge, size_t size, size_t *out_size, cha
             free(ptr);
             ptr = NULL;
         }
+        VR_LOG(LOG_ERROR, "Error trying to hash encrypted challenge with SHA-256");
         return NULL;
     }
         
@@ -1920,16 +2082,6 @@ char *get_challenge_solution(char *challenge, size_t size, size_t *out_size, cha
     
     *out_size = s_out_size;
     return sol;
-}
-
-void generate_random_challenge(char *chall, size_t chall_sz) {
-    if(!chall || chall_sz == 0)
-        return;
-   
-    for(int i = 0 ; i < chall_sz ; i++)
-        chall[i] = (rand() % (MAX_CHALL_CHR_VAL - MIN_CHALL_CHR_VAL + 1)) + MIN_CHALL_CHR_VAL;
-   
-    return;
 }
 
 int handshake(int sock) {
@@ -1945,12 +2097,17 @@ int handshake(int sock) {
        return 0;
 
     generate_random_challenge(chall, CHALLENGE_DEFAULT_SIZE);
+    
+    hexdump("challenge", chall, CHALLENGE_DEFAULT_SIZE);
 
     p = get_challenge_solution(chall, CHALLENGE_DEFAULT_SIZE, &out_size, _key, _key_sz);
     if(!p || out_size == 0) {
+        VR_LOG(LOG_ERROR, "Error when getting challenge solution");
         err = 1;
         goto end;
     }
+    
+    hexdump("challenge solution", p, out_size);
 
     p_clt = calloc(out_size, sizeof(char));
     if(!p_clt) {
@@ -1960,38 +2117,50 @@ int handshake(int sock) {
 
     r = write(sock, chall, CHALLENGE_DEFAULT_SIZE);
     if(r <= 0) {
+        VR_LOG(LOG_ERROR, "Error trying to send challenge to client");
         err = 1;
         goto end;
     }
 
     r = read(sock, p_clt, out_size);
     if(r <= 0) {
+        VR_LOG(LOG_ERROR, "Error trying to receive solution from client");
         err = 1;
         goto end;
     }
+    
+    hexdump("client-provided solution", p_clt, out_size);
 
     if(r != out_size) {
+        VR_LOG(LOG_ERROR, "Provided input size is not the same size as the solution");
         err = 1;
         goto end;
     }
 
     if(memcmp(p_clt, p, out_size) != 0) {
+        VR_LOG(LOG_INFO, "Client failed authentication with a wrong challenge solution");
         cid = 0;
     } else {
+        VR_LOG(LOG_INFO, "Client succeed providing right solution for challenge");
         cid = create_client(sock, NULL, 0, TCP_COM_PROTO);
         if(cid <= 0) {
+            VR_LOG(LOG_ERROR, "Error trying to create new client");
             err = 1;
             goto end;
         }
+        
+        VR_LOG(LOG_INFO, "Client ID created: %ld", cid);
     }
 
     r = write(sock, &cid, sizeof(uint32_t));
     if(r <= 0 || r != sizeof(uint32_t)) {
+        VR_LOG(LOG_ERROR, "Error trying to send final verdict with client_id: %d", cid);
         err = 1;
         goto end;
     }
 
     if(cid == 0) {
+        VR_LOG(LOG_ERROR, "Handshake is failed by client, cid = 0");
         err = 1;
         goto end;
     }
@@ -2026,6 +2195,12 @@ int relay_tcp_srv_poll(int sock) {
     char *tmp_buffer = NULL;
     size_t tmp_buffer_sz = 0;
     ssize_t rx = 0;
+    char *qdata = NULL;
+    size_t qsize = 0;
+    char *enc = NULL;
+    size_t enc_sz = 0;
+    char *dec = NULL;
+    size_t dec_sz = 0;
   
     if(sock < 0) {
         err = 1;
@@ -2033,36 +2208,95 @@ int relay_tcp_srv_poll(int sock) {
     }
   
     if(!(cid = handshake(sock))) {
+        VR_LOG(LOG_INFO, "Handshake failed for client");
         err = 1;
         goto end;
     }
 
     fds[0].fd = sock;
     fds[0].events = POLLIN;
+    
+    puts("srv loopAAAAAAAAAAAAAAAAAAAAAAAon");
   
     while(1) {
+        puts("srv loopon");
+        
         if(tmp_buffer) {
             free(tmp_buffer);
             tmp_buffer = NULL;
-        }     
-        res = poll(fds, 1, -1);
+        }
+        
+        if(dec) {
+            free(dec);
+            dec = NULL;
+        }
+        
+        if(qdata) {
+            free(qdata);
+            qdata = NULL;
+        }
+        
+        if(is_route_discovery_in_process() && !is_client_in_checked_list(cid)) {
+            VR_LOG(LOG_DEBUG, "There is a discovery process currently. Testing this node as a possible route...");
+            qdata = get_route_req_open_cmd(cid, &qsize);   
+            if(!qdata || qsize == 0) {
+                VR_LOG(LOG_ERROR, "get_route_req_open_cmd() returned NULL...");
+                err = 1;
+                goto end;
+            }
+            
+            VR_LOG(LOG_DEBUG, "Encrypting output data...");
+            
+            enc = encrypt_data(qdata, qsize, _key, _key_sz, &enc_sz);
+            if(!enc) {
+                VR_LOG(LOG_ERROR, "Error trying to encrypt data");
+                err = 1;
+                goto end;
+            }
+            
+            VR_LOG(LOG_DEBUG, "Sending packet to client (size=%ld)...", enc_sz);
+            
+            rx = write_all(sock, &enc, &enc_sz);
+            if(rx < 0) {
+                VR_LOG(LOG_ERROR, "Error trying to write data");
+                err = 1;
+                goto end;
+            }
+            
+            if(enc) {
+                free(enc);
+                enc = NULL;
+            }
+            
+            sleep(1);
+            
+            continue;
+        }
+        
+        puts("srv ewgawgloopon");
+        
+        res = poll(fds, 1, POLL_TIMEOUT);
         if(res == -1) {
             if(cid) {
                 close_client(cid);
                 cid = 0;
             }
+            VR_LOG(LOG_ERROR, "Error at poll");
             err = 1;
             goto end;
         } else if(res == 0) {
+            puts("srv lowwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwopon");
             continue;
         } else {
             if(fds[0].revents & POLLIN) {
+                puts("srv loopon333333333333333333333333333333333333333333333333333333");
                 rx = read_all(sock, &tmp_buffer, &tmp_buffer_sz);
                 if(rx < 0) {
                     if(cid) {
                         close_client(cid);
                         cid = 0;
                     }
+                    VR_LOG(LOG_ERROR, "Error trying to read data");
                     err = 1;
                     goto end;
                 } else if(rx == 0) { /* conn closed */
@@ -2073,8 +2307,19 @@ int relay_tcp_srv_poll(int sock) {
                     err = 0;
                     goto end;
                 }
+                
+                hexdump("encrypted packet", tmp_buffer, tmp_buffer_sz);
+                
+                dec = decrypt_data(tmp_buffer, tmp_buffer_sz, _key, _key_sz, &dec_sz);
+                if(!dec) {
+                    err = 1;
+                    goto end;
+                }
+                
+                hexdump("decrypted packet", dec, dec_sz);
             
-                if(!interpret_remote_packet(cid, tmp_buffer, tmp_buffer_sz)) {
+                if(!interpret_remote_packet(cid, dec, dec_sz)) {
+                    VR_LOG(LOG_ERROR, "Error trying to interpret received packet");
                     err = 1;
                     goto end;
                 }
@@ -2097,6 +2342,21 @@ end:
     if(cid > 0) {
         close_client(cid);
         cid = 0;
+    }
+    
+    if(dec) {
+        free(dec);
+        dec = NULL;
+    }
+    
+    if(enc) {
+        free(enc);
+        enc = NULL;
+    }
+    
+    if(qdata) {
+        free(qdata);
+        qdata = NULL;
     }
 
     if(tmp_buffer) {
@@ -2130,8 +2390,10 @@ ssize_t http_write_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int i
             r = SSL_write(c_ssl, ptr, sz - sent);
         else
             r = write(sock, ptr, sz - sent);
-        if(r < 0)
+        if(r < 0) {
+            VR_LOG(LOG_ERROR, "Error trying to write data");
             return -1;
+        }
         sent += r;
     }
 
@@ -2164,8 +2426,10 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
       return -1;
     */
         sock_m = SSL_get_fd(c_ssl);
-        if(sock_m < 0)
+        if(sock_m < 0) {
+            VR_LOG(LOG_ERROR, "SSL_get_fd returned negative");
             return -1;
+        }
     } else {
         sock_m = sock;
     }
@@ -2175,8 +2439,10 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
     #else
     r = ioctl(sock_m, FIONREAD, &bytes_available);
     #endif
-    if(r < 0)
+    if(r < 0) {
+        VR_LOG(LOG_ERROR, "Error at ioctl() with FIONREAD");
         return -1;
+    }
 
     if(bytes_available < 0) {
         *data = NULL;
@@ -2194,8 +2460,10 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
             r = SSL_read(c_ssl, ptr, bytes_available - sent);
         else
             r = read(sock, ptr, bytes_available - sent);
-        if(r < 0)
+        if(r < 0) {
+            VR_LOG(LOG_ERROR, "Error trying to receive data");
             return -1;
+        }
 
         sent += r;
       
@@ -2204,8 +2472,10 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
         #else
         rx = ioctl(sock_m, FIONREAD, &bavailable_x);
         #endif
-        if(rx < 0)
+        if(rx < 0) {
+            VR_LOG(LOG_ERROR, "Error at ioctl() with FIONREAD");
             return -1;
+        }
     
         if(bavailable_x <= 0)
             break;
@@ -2244,6 +2514,7 @@ int get_get_param(char *data, size_t data_sz, int is_handshake) {
             free(p);
             p = NULL;
         }
+        VR_LOG(LOG_ERROR, "Could not find parameter in HTTP request");
         return -1;
     }
     p3 = p2 + strlen(keyword);
@@ -2262,6 +2533,7 @@ int get_get_param(char *data, size_t data_sz, int is_handshake) {
             free(p);
             p = NULL;
         }
+        VR_LOG(LOG_ERROR, "Provided request is invalid");
         return -1;
     }
            
@@ -2271,6 +2543,7 @@ int get_get_param(char *data, size_t data_sz, int is_handshake) {
             free(p);
             p = NULL;
         }
+        VR_LOG(LOG_ERROR, "Received parameter is invalid");
         return -1;
     }
            
@@ -2296,7 +2569,7 @@ char *get_data_from_http(char *data, size_t data_sz, size_t *out_size) {
     
     p = memdup(data, data_sz);
     if(!p) {
-        return -1;
+        return NULL;
     }
     
     p2 = strstr(p, DATA_INPUT_PREFIX);
@@ -2305,6 +2578,7 @@ char *get_data_from_http(char *data, size_t data_sz, size_t *out_size) {
             free(p);
             p = NULL;
         }
+        VR_LOG(LOG_ERROR, "Could not find HTTP request prefix");
         return NULL;
     }
     p2 += sizeof(DATA_INPUT_PREFIX);
@@ -2315,6 +2589,7 @@ char *get_data_from_http(char *data, size_t data_sz, size_t *out_size) {
             free(p);
             p = NULL;
         }
+        VR_LOG(LOG_ERROR, "Could not find HTTP request suffix");
         return NULL;
     }
    
@@ -2326,6 +2601,7 @@ char *get_data_from_http(char *data, size_t data_sz, size_t *out_size) {
             free(p);
             p = NULL;
         }
+        VR_LOG(LOG_ERROR, "Error trying to do base64 decoding");
         return NULL;
     }
   
@@ -2352,6 +2628,7 @@ char *get_http_data_response(char *data, size_t data_sz, size_t *out_size) {
   
     b64_p = base64_encode(data, data_sz, &b64_sz);
     if(!b64_p || b64_sz == 0) {
+        VR_LOG(LOG_ERROR, "Error trying to do base64 encoding");
         *out_size = 0;
         return NULL;
     }
@@ -2380,7 +2657,7 @@ char *get_http_data_response(char *data, size_t data_sz, size_t *out_size) {
 int is_client_in_checked_list(int client_id) {
     int found = 0;
     
-    if(client_id < 0)
+    if(client_id <= 0)
         return 0;
         
     pthread_mutex_lock(&route_open_lock);
@@ -2456,7 +2733,7 @@ int is_route_discovery_in_process(void) {
         return 0;
     }
     
-    if(conn_req_glb->ip != 0 && conn_req_glb->port != 0) {
+    if(conn_req_glb->ip == 0 || conn_req_glb->port == 0) {
         pthread_mutex_unlock(&route_open_lock);
         return 0;
     }
@@ -2470,9 +2747,10 @@ char *get_route_req_open_cmd(int client_id, size_t *out_size) {
     char *p = NULL;
     tlv_header *tlv = NULL;
     conn_cmd *c_cmd = NULL;
+    int idx = -1;
     
     if(client_id <= 0 || !out_size)
-        return 0;
+        return NULL;
     
     *out_size = 0;
     
@@ -2480,12 +2758,12 @@ char *get_route_req_open_cmd(int client_id, size_t *out_size) {
     
     if(!conn_req_glb || conn_req_glb->is_routed == 1) {
         pthread_mutex_unlock(&route_open_lock);
-        return 0;
+        return NULL;
     }
     
-    if(conn_req_glb->ip != 0 && conn_req_glb->port != 0) {
+    if(conn_req_glb->ip == 0 || conn_req_glb->port == 0) {
         pthread_mutex_unlock(&route_open_lock);
-        return 0;
+        return NULL;
     }
     
     osz = sizeof(tlv_header) + sizeof(conn_cmd);
@@ -2498,13 +2776,29 @@ char *get_route_req_open_cmd(int client_id, size_t *out_size) {
     c_cmd = (conn_cmd *)((char *)p + sizeof(tlv_header));
     
     tlv->client_id = client_id;
-    tlv->channel_id = conn_req_glb->channel_id;
+    tlv->channel_id = COMMAND_CHANNEL;
     tlv->tlv_data_len = sizeof(conn_cmd);
     
-    c_cmd->cmd = CHANNEL_OPEN_CMD;
+    c_cmd->cmd = cmd_def_data[CHANNEL_OPEN_CMD].value;
     c_cmd->channel_id = conn_req_glb->channel_id;
-    c_cmd->ip_addr = conn_req_glb->ip;
+    c_cmd->ip_addr = htonl(conn_req_glb->ip);
     c_cmd->port = conn_req_glb->port;
+    
+    for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+        if(conn_req_glb->client_id_arr[i] == 0) {
+            idx = i;
+            break;
+        }
+    }
+    
+    if(idx == -1) {
+        VR_LOG(LOG_ERROR, "No space left in conn_req_glb->client_id_arr, MAX_CONCURRENT_CLIENTS reached");
+        *out_size = 0;
+        pthread_mutex_unlock(&route_open_lock);
+        return NULL;
+    }
+    
+    conn_req_glb->client_id_arr[idx] = client_id;
     
     pthread_mutex_unlock(&route_open_lock);
     
@@ -2512,14 +2806,13 @@ char *get_route_req_open_cmd(int client_id, size_t *out_size) {
     return p; 
 }
 
-int issue_connection_open(uint32_t ip_addr, uint16_t port) {
+int issue_connection_open(int proxy_sock, uint32_t ip_addr, uint16_t port) {
     int channel_id = 0;
     int err = 0;
     int success = 0;
     int client_id = 0;
     int c_id = 0;
     char *host = NULL;
-    int proxy_sock = 0;
     time_t route_req_init_time = 0;
     time_t curr_time = 0;
     struct in_addr i_addr;
@@ -2532,7 +2825,17 @@ int issue_connection_open(uint32_t ip_addr, uint16_t port) {
         conn_req_glb = NULL;
     }
     
+    VR_LOG(LOG_DEBUG, "Allocating conn_req_glb instance...");
+    
+    conn_req_glb = (conn_open_req *)calloc(1, sizeof(conn_open_req));
+    if(!conn_req_glb) {
+        err = 1;
+        goto end;
+    }
+    
     channel_id = generate_channel_id();
+    
+    VR_LOG(LOG_DEBUG, "Generated temporary channel_id: %ld", channel_id);
     
     conn_req_glb->is_routed = 0;
     conn_req_glb->client_id = 0;
@@ -2545,10 +2848,15 @@ int issue_connection_open(uint32_t ip_addr, uint16_t port) {
     
     route_req_init_time = time(NULL);
     
+    VR_LOG(LOG_DEBUG, "Starting connection open request main loop...");
+    
     while(1) {
         curr_time = time(NULL);
         
+        VR_LOG(LOG_DEBUG, "New loop iter for route discovery...");
+        
         if((curr_time - route_req_init_time) >= ROUTE_REQUEST_PROCESS_TIMEOUT) {
+            VR_LOG(LOG_INFO, "Timed out tring to open a new connection...");
             success = 0;
             break;
         }
@@ -2556,6 +2864,7 @@ int issue_connection_open(uint32_t ip_addr, uint16_t port) {
         pthread_mutex_lock(&route_open_lock);
         
         if(conn_req_glb->is_routed && conn_req_glb->client_id != 0) {
+            VR_LOG(LOG_DEBUG, "Discovery process finished, route discovered successfully...");
             success = 1;
             client_id = conn_req_glb->client_id;
             pthread_mutex_unlock(&route_open_lock);
@@ -2575,18 +2884,16 @@ int issue_connection_open(uint32_t ip_addr, uint16_t port) {
     i_addr.s_addr = ip_addr;
     host = inet_ntoa(i_addr);
     if(!host) {
+        VR_LOG(LOG_ERROR, "Error at inet_ntoa");
         err = 1;
         goto end;
     }
     
-    proxy_sock = get_proxy_sock_by_channel_id(channel_id);
-    if(proxy_sock < 0) {
-        err = 1;
-        goto end;
-    }
+    VR_LOG(LOG_DEBUG, "Creating a new channel for channel_id: %ld", channel_id);
     
     c_id = create_channel_custom(channel_id, client_id, proxy_sock, host, port);
     if(c_id <= 0 || c_id != channel_id) {
+        VR_LOG(LOG_ERROR, "Error trying to create a channel");
         err = 1;
         goto end;
     }
@@ -2595,15 +2902,17 @@ int issue_connection_open(uint32_t ip_addr, uint16_t port) {
 end:
     if(err)
         channel_id = 0;
-        
-    conn_req_glb->is_routed = 0;
-    conn_req_glb->client_id = 0;
-    conn_req_glb->channel_id = 0;
-    conn_req_glb->ip = 0;
-    conn_req_glb->port = 0;
     
-    for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++)
-        conn_req_glb->client_id_arr[i] = 0;
+    if(conn_req_glb) {
+        conn_req_glb->is_routed = 0;
+        conn_req_glb->client_id = 0;
+        conn_req_glb->channel_id = 0;
+        conn_req_glb->ip = 0;
+        conn_req_glb->port = 0;
+    
+        for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++)
+            conn_req_glb->client_id_arr[i] = 0;
+    }
         
     if(conn_req_glb) {
         free(conn_req_glb);
@@ -2658,12 +2967,14 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
     p3 = NULL;
    
     if(req_type == UNKNOWN_REQUEST_TYPE) {
+        VR_LOG(LOG_ERROR, "Unknown request type");
         *out_size = 0;
         return NULL;
     }
    
     param = get_get_param(data, data_sz, (req_type == HANDSHAKE_SESSION_TYPE) ? 1 : 0);
     if(param <= 0) {
+        VR_LOG(LOG_ERROR, "Error trying to get parameter");
         *out_size = 0;
         goto end;
     }
@@ -2674,17 +2985,20 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
         if(req_type == DATA_SENDING_TYPE) {
             enc = get_data_from_http(data, data_sz, &enc_sz);
             if(enc || enc_sz == 0) {
+                VR_LOG(LOG_ERROR, "Error trying to get data from HTTP request");
                 err = 1;
                 goto end;
             }
 
             raw = decrypt_data(enc, enc_sz, _key, _key_sz, &raw_sz);
             if(!raw || raw_sz == 0) {
+                VR_LOG(LOG_ERROR, "Error trying to decrypt data");
                 err = 1;
                 goto end;
             }
 		   
             if(!interpret_remote_packet(cid, raw, raw_sz)) {
+                VR_LOG(LOG_ERROR, "Error trying to interpret remote packet");
                 err = 1;
                 goto end;
             }
@@ -2698,23 +3012,31 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
             return NULL;
         } else if(req_type == DATA_REQUEST_TYPE) {
             // TODO: should we add more locking here to ensure concurrency issues on multiple clients at once?
+            VR_LOG(LOG_DEBUG, "Data requested by client...");
             
-            if(is_route_discovery_in_process() && !is_client_in_checked_list(cid))
+            if(is_route_discovery_in_process() && !is_client_in_checked_list(cid)) {
+                VR_LOG(LOG_DEBUG, "There is a discovery process currently. Testing this node as a possible route...");
                 qdata = get_route_req_open_cmd(cid, &qsize);    
-            else
+            } else {
+                VR_LOG(LOG_DEBUG, "Trying to retrieve queued data...");
                 qdata = get_next_queued_data(cid, &qsize);
-
+            }
+            
             if(!qdata || qsize == 0) {
+                VR_LOG(LOG_WARN, "No data to be returned. Dummy response...");
                 *out_size = 0;
                 return NULL;
             }
-	   	   
+	    
+	    VR_LOG(LOG_DEBUG, "Encrypting output data...");
+	    
             enc = encrypt_data(qdata, qsize, _key, _key_sz, &enc_sz);
             if(!enc) {
                 if(qdata) {
                     free(qdata);
                     qdata = NULL;
                 }
+                VR_LOG(LOG_ERROR, "Error trying to encrypt data");
                 *out_size = 0;
                 return NULL;
             }
@@ -2730,6 +3052,7 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
                     free(enc);
                     enc = NULL;
                 }
+                VR_LOG(LOG_ERROR, "Error trying to craft a valid HTTP response");
                 err = 1;
                 goto end;
             }
@@ -2746,18 +3069,21 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
                 if(is_challenge_solved(h_id)) {
                     cid = create_client(-1, NULL, 0, _proto);
                     if(cid <= 0) {
+                        VR_LOG(LOG_ERROR, "Error trying to create a new client");
                         err = 1;
                         goto end;
                     }
                 } else if (is_challenge_failure(h_id)) {
                     cid = 0;
                 } else {
+                    VR_LOG(LOG_ERROR, "Unknown error");
                     err = 1;
                     goto end;
                 }
         
                 out = get_http_data_response(&cid, sizeof(uint32_t), &osz);
                 if(!out || osz == 0) {
+                    VR_LOG(LOG_ERROR, "Error when trying to craft a valid HTTP response (2)");
                     err = 1;
                     goto end;
                 }
@@ -2766,12 +3092,14 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
             } else {
                 raw = get_data_from_http(data, data_sz, &raw_sz);
                 if(raw || raw_sz == 0) {
+                    VR_LOG(LOG_ERROR, "Error trying to get raw data");
                     err = 1;
                     goto end;
                 }
 		  
                 real_sol = get_h_challenge_solution(h_id, &real_sol_sz);
                 if(!real_sol) {
+                    VR_LOG(LOG_ERROR, "Error trying to get the challenge saved solution");
                     err = 1;
                     goto end;
                 }
@@ -2779,12 +3107,14 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
                 if(raw_sz == real_sol_sz && (memcmp(raw, real_sol, raw_sz) == 0)) {
                     VR_LOG(LOG_INFO, "Challenge solution provided by client is correct");
                     if(!mark_challenge_solved(h_id)) {
+                        VR_LOG(LOG_ERROR, "Error trying to mark challenge as solved");
                         err = 1;
                         goto end;
                     }
                 } else {
                     VR_LOG(LOG_INFO, "Challenge solution provided by client is wrong");
                     if(!mark_challenge_failure(h_id)) {
+                        VR_LOG(LOG_ERROR, "Error trying to mark challenge as failed to solve");
                         err = 1;
                         goto end;
                     }
@@ -2799,18 +3129,21 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
             }
         } else {
             if(!create_handshake(h_id)) {
+                VR_LOG(LOG_ERROR, "Error trying to create handshake");
                 err = 1;
                 goto end;
             }
              
             chall = get_challenge(h_id);
             if(!chall) {
+                VR_LOG(LOG_ERROR, "Error trying to get challenge");
                 err = 1;
                 goto end;
             }
              
             out = get_http_data_response(chall, CHALLENGE_DEFAULT_SIZE, &osz);
             if(!out || osz == 0) {
+                VR_LOG(LOG_ERROR, "Error trying to craft a valid HTTP response (3)");
                 err = 1;
                 goto end;
             }
@@ -2868,6 +3201,7 @@ int relay_http_srv_handle_req(rl_arg_pass *arg) {
   
     r = http_read_all(sock, c_ssl, &data, &data_sz, is_https);
     if(r < 0) {
+        VR_LOG(LOG_ERROR, "Error trying to read HTTP request");
         err = 1;
         goto end;
     }
@@ -2893,6 +3227,7 @@ int relay_http_srv_handle_req(rl_arg_pass *arg) {
    
     r = http_write_all(sock, c_ssl, &out, &out_size, is_https);
     if(r < 0) {
+        VR_LOG(LOG_ERROR, "Error trying to send HTTP response");
         err = 1;
         goto end;
     }
@@ -2949,6 +3284,9 @@ void proxy_srv_poll(int sock) {
     uint32_t ip_addr_i = 0;
     uint16_t port = 0;
     struct in_addr ip_addr;
+    char *enc = NULL;
+    size_t enc_sz = 0;
+    int no_ccleanup = 0;
    
     if(sock < 0) {
         err = 1;
@@ -2957,29 +3295,33 @@ void proxy_srv_poll(int sock) {
    
     r = read(sock, socks_hdr_buf, sizeof(socks_hdr));
     if(r < 0) {
+        VR_LOG(LOG_ERROR, "Error when reading SOCKS header from proxy client");
         err = 1;
         goto end;
     }
    
     if(r != sizeof(socks_hdr)) {
+        VR_LOG(LOG_ERROR, "Received number of bytes does NOT correspond to the size of a SOCKS header");
         err = 1;
         goto end;
     }
    
-    if(!parse_socks_hdr(socks_hdr_buf, sizeof(socks_hdr), &rhost, &rport)) {
+    if(!parse_socks_hdr((char *)socks_hdr_buf, sizeof(socks_hdr), &rhost, &rport)) {
+        VR_LOG(LOG_ERROR, "Error when parsing SOCKS header provided by proxy client");
         err = 1;
         goto end;
     }
    
     if(!rhost || rport <= 0) {
+        VR_LOG(LOG_ERROR, "Proxy client provided wrong host or port values...");
         err = 1;
         goto end;
     }
-   
 
     VR_LOG(LOG_INFO, "Connection target is: %s:%d", rhost, rport);
 
     if(inet_pton(AF_INET, rhost, &ip_addr) == 0) {
+        VR_LOG(LOG_ERROR, "Error at inet_pron()");
         err = 1;
         goto end;
     }
@@ -2988,10 +3330,13 @@ void proxy_srv_poll(int sock) {
     
     port = (int16_t)rport;
     
-    channel_id = issue_connection_open(ip_addr_i, port);
-    if(channel_id < 0) {
+    VR_LOG(LOG_DEBUG, "Issuing connection open request for %s:%d...", rhost, rport);
+    
+    channel_id = issue_connection_open(sock, ip_addr_i, port);
+    if(channel_id <= 0) {
         r = write(sock, SOCKS_REPLY_FAILURE, sizeof(SOCKS_REPLY_FAILURE));
         if(r < 0) {
+           VR_LOG(LOG_ERROR, "Error when replying to SOCKS proxy client");
            err = 1;
            goto end;
         }
@@ -3000,25 +3345,39 @@ void proxy_srv_poll(int sock) {
     } else {
         r = write(sock, SOCKS_REPLY_SUCCESS, sizeof(SOCKS_REPLY_FAILURE));
         if(r < 0) {
+           VR_LOG(LOG_ERROR, "Error when replying to SOCKS proxy client");
            err = 1;
            goto end;
         }
     }
+    
+    VR_LOG(LOG_DEBUG, "Creating proxy client definition...");
 
     proxy_client_id = create_proxy_client(sock, NULL, 0, channel_id);
-    if(proxy_client_id < 0) {
+    if(proxy_client_id <= 0) {
+        VR_LOG(LOG_ERROR, "Error when creating a new proxy client definition");
         err = 1;
         goto end;
     }
     
     fds[0].fd = sock;
     fds[0].events = POLLIN;
+    
+    VR_LOG(LOG_DEBUG, "Starting proxy srv main polling loop...");
   
     while(1) {
+        if(!channel_exists(channel_id)) {
+            no_ccleanup = 1;
+            close(sock);
+            err = 0;
+            goto end;
+        }
+        
         memset(tmp_buffer, 0, RELAY_BUFFER_SIZE);
      
-        res = poll(fds, 1, -1);
+        res = poll(fds, 1, POLL_TIMEOUT);
         if(res == -1) {
+            VR_LOG(LOG_ERROR, "Error at poll");
             err = 1;
             goto end;
         } else if(res == 0) {
@@ -3027,40 +3386,69 @@ void proxy_srv_poll(int sock) {
             if(fds[0].revents & POLLIN) {
                 r = read(sock, tmp_buffer, RELAY_BUFFER_SIZE);
                 if(r < 0) {
+                    VR_LOG(LOG_ERROR, "Error when receiving data from SOCKS proxy client");
                     err = 1;
                     goto end;
                 } else if(r == 0) { /* conn closed */
                     err = 0;
                     goto end;
                 }
+                
+                VR_LOG(LOG_DEBUG, "Received %d bytes from SOCKS proxy client...", r);
+                
+                hexdump("proxy client received data", tmp_buffer, r);
             
-                p = pack_proxy_data(channel_id, tmp_buffer, RELAY_BUFFER_SIZE, &p_sz);
+                p = pack_proxy_data(channel_id, tmp_buffer, r, &p_sz);
                 if(!p) {
+                    VR_LOG(LOG_ERROR, "Error trying to pack raw data into tlv_header");
                     err = 1;
                     goto end;
                 }
 
                 client_id = get_client_by_channel_id(channel_id);
-                if(client_id < 0) {
+                if(client_id <= 0) {
+                    VR_LOG(LOG_ERROR, "Error when trying to get client_id from channel_id: %d", channel_id);
                     err = 1;
                     goto end;
                 }
+                
+                VR_LOG(LOG_DEBUG, "Client to send data to has client ID: %d", client_id);
                
                 if(_proto == TCP_COM_PROTO) {
                     rsock = get_relay_sock_by_client_id(client_id);
                     if(rsock < 0) {
+                        VR_LOG(LOG_ERROR, "Error when trying to get sock from client_id: %d", client_id);
                         err = 1;
                         goto end;
                     }
-
-                    rx = write_all(rsock, &p, &p_sz);
-                    if(rx < 0) {
+                    
+                    VR_LOG(LOG_DEBUG, "TCP relay client sock: %d", rsock);
+                    
+                    enc = encrypt_data(p, p_sz, _key, _key_sz, &enc_sz);
+                    if(!enc) {
+                        VR_LOG(LOG_ERROR, "Error when trying to encrypt data");
                         err = 1;
                         goto end;
+                    }
+                    
+                    VR_LOG(LOG_DEBUG, "Relaying %d bytes of data to TCP relay client", enc_sz);
+
+                    rx = write_all(rsock, &enc, &enc_sz);
+                    if(rx < 0) {
+                        VR_LOG(LOG_ERROR, "Error when trying to send data to client");
+                        err = 1;
+                        goto end;
+                    }
+                    
+                    if(enc) {
+                        free(enc);
+                        enc = NULL;
                     }
                 } else if(_proto == HTTP_COM_PROTO || 
                                 _proto == HTTPS_COM_PROTO) {
+                    VR_LOG(LOG_DEBUG, "Queuing %d bytes of data...", p_sz);
                     if(!queue_data(client_id, p, p_sz, time(NULL))) {
+                        VR_LOG(LOG_ERROR, "Error when trying to queue data");
                         err = 1;
                         goto end;
                     }
@@ -3082,14 +3470,17 @@ void proxy_srv_poll(int sock) {
     
     err = 0;
 end:
-    if(!send_remote_cmd(CHANNEL_CLOSE_CMD, channel_id))
+       
+    if(!no_ccleanup && channel_id != 0 && !send_remote_cmd(CHANNEL_CLOSE_CMD, channel_id)) {
+        VR_LOG(LOG_ERROR, "Error sending CHANNEL_CLOSE_CMD to the remote end with channel ID: %d", channel_id);
         err = 1;
+    }
     
     if(proxy_client_id != 0)
         close_proxy_client(proxy_client_id);
     
-    if(channel_id) {
-        close_channel(channel_id);
+    if(channel_id != 0) {
+        close_channel(channel_id, 0);
         channel_id = 0;
     }
     
@@ -3115,6 +3506,7 @@ void start_proxy_srv(arg_pass *arg) {
     int idx = 0;
     size_t addr_len = 0;
     int port = 0;
+    int addrlen = 0;
     pthread_t tid[MAX_CONCURRENT_PROXY_CLIENTS] = { 0 };
     char ip[INET_ADDRSTRLEN] = { 0 };
   
@@ -3162,11 +3554,15 @@ void start_proxy_srv(arg_pass *arg) {
     i = 0;
     while(1) {
         if(close_srv) {
+            VR_LOG(LOG_INFO, "Order to shutdown the server. Closing...");
             goto end;
         }
      
         if(i >= MAX_CONCURRENT_PROXY_CLIENTS) {
             for(int x = 0 ; x < MAX_CONCURRENT_PROXY_CLIENTS ; x++) {
+                if(tid[x] == 0)
+                    continue;
+                    
                 res = pthread_kill(tid[x], 0);
                 if(res == 0)
                     continue;
@@ -3181,8 +3577,8 @@ void start_proxy_srv(arg_pass *arg) {
              
         }
      
-     
-    connfd = accept(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
+    addrlen = sizeof(servaddr);
+    connfd = accept(sfd, (struct sockaddr *)&servaddr, (socklen_t *)&addrlen);
     if(connfd < 0) {
         VR_LOG(LOG_ERROR, "Failed accepting connection");
         continue;
@@ -3190,7 +3586,7 @@ void start_proxy_srv(arg_pass *arg) {
      
     VR_LOG(LOG_INFO, "Client connected to SOCKS proxy server...");
      
-    z = -1;
+    z = 0;
     while(z < MAX_CONCURRENT_PROXY_CLIENTS) {
         if(tid[z] == 0)
             break;
@@ -3214,9 +3610,15 @@ void start_proxy_srv(arg_pass *arg) {
 end:
     z = 0;
     while(z < MAX_CONCURRENT_PROXY_CLIENTS) {
+        if(tid[z] == 0) {
+            z++;
+            continue;
+        }
+            
         res = pthread_cancel(tid[z]);
         if(res != 0) {
             VR_LOG(LOG_ERROR, "Error trying to cancel thread");
+            z++;
             continue;
         }
         z++;
@@ -3231,6 +3633,8 @@ end:
         close_srv = 1;
         sleep(2);
     }
+    
+    close_srv = 1;
 
     pthread_exit(NULL);
     return;
@@ -3260,6 +3664,7 @@ int do_http_relay_srv(char *host, int port) {
     int connfd = 0;
     int z = 0;
     int idx = 0;
+    int addrlen = 0;
     pthread_t tid[MAX_CONCURRENT_CLIENTS] = { 0 };
     rl_arg_pass *a_pass = NULL;
     int is_https = 0;
@@ -3276,15 +3681,18 @@ int do_http_relay_srv(char *host, int port) {
         ssl_initialization();
         _ctx = SSL_CTX_new(TLS_server_method());
         if (!_ctx) {
+            VR_LOG(LOG_ERROR, "Error starting a new SSL context");
             err = 1;
             goto end;
         }
 
         if(SSL_CTX_use_certificate_file(_ctx, _cert_file, SSL_FILETYPE_PEM) <= 0) {
+            VR_LOG(LOG_ERROR, "Error applying certificate...");
             err = 1;
             goto end;
         }
         if(SSL_CTX_use_PrivateKey_file(_ctx, _cert_file, SSL_FILETYPE_PEM) <= 0) {
+            VR_LOG(LOG_ERROR, "Error applying private key file...");
             err = 1;
             goto end;
         }
@@ -3322,11 +3730,15 @@ int do_http_relay_srv(char *host, int port) {
     i = 0;
     while(1) {
         if(close_srv) {
+            VR_LOG(LOG_INFO, "Order to shutdown the server. Closing...");
             goto end;
         }
      
         if(i >= MAX_CONCURRENT_CLIENTS) {
             for(int x = 0 ; x < MAX_CONCURRENT_CLIENTS ; x++) {
+                if(tid[x] == 0)
+                    continue;
+                    
                 res = pthread_kill(tid[x], 0);
                 if(res == 0)
                     continue;
@@ -3341,8 +3753,8 @@ int do_http_relay_srv(char *host, int port) {
              
         }
      
-     
-        connfd = accept(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
+        addrlen = sizeof(servaddr);
+        connfd = accept(sfd, (struct sockaddr *)&servaddr, (socklen_t *)&addrlen);
         if(connfd < 0) {
             VR_LOG(LOG_ERROR, "Error accepting conenction");
             continue;
@@ -3358,7 +3770,7 @@ int do_http_relay_srv(char *host, int port) {
 
         VR_LOG(LOG_INFO, "Client connected to relay server...");
      
-        z = -1;
+        z = 0;
         while(z < MAX_CONCURRENT_CLIENTS) {
             if(tid[z] == 0)
                 break;
@@ -3377,6 +3789,7 @@ int do_http_relay_srv(char *host, int port) {
         }
      
         if(_proto == TCP_COM_PROTO) {
+            VR_LOG(LOG_ERROR, "_proto is TCP_COM_PROTO, though we are in an HTTP relay function. WTF");
             err = 1;
             goto end;
         }
@@ -3404,6 +3817,11 @@ end:
 
     z = 0;
     while(z < MAX_CONCURRENT_CLIENTS) {
+        if(tid[z] == 0) {
+            z++;
+            continue;
+        }
+            
         res = pthread_cancel(tid[z]);
         if(res != 0) {
             VR_LOG(LOG_ERROR, "Error trying to cancel thread");
@@ -3416,6 +3834,8 @@ end:
         close_srv = 1;
         sleep(2);
     }
+    
+    close_srv = 1;
 
     return (err == 0);
 }
@@ -3429,6 +3849,7 @@ int do_tcp_relay_srv(char *host, int port) {
     int connfd = 0;
     int z = 0;
     int idx = 0;
+    int addrlen = 0;
     pthread_t tid[MAX_CONCURRENT_CLIENTS] = { 0 };
   
     if(!host || port <= 0) {
@@ -3468,11 +3889,15 @@ int do_tcp_relay_srv(char *host, int port) {
     i = 0;
     while(1) {
         if(close_srv) {
+            VR_LOG(LOG_INFO, "Order to shutdown the server. Closing...");
             goto end;
         }
      
         if(i >= MAX_CONCURRENT_CLIENTS) {
             for(int x = 0 ; x < MAX_CONCURRENT_CLIENTS ; x++) {
+                if(tid[x] == 0)
+                    continue;
+                    
                 res = pthread_kill(tid[x], 0);
                 if(res == 0)
                     continue;
@@ -3486,8 +3911,8 @@ int do_tcp_relay_srv(char *host, int port) {
             }
         }
      
-     
-        connfd = accept(sfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
+        addrlen = sizeof(servaddr);
+        connfd = accept(sfd, (struct sockaddr *)&servaddr, (socklen_t *)&addrlen);
         if(connfd < 0) {
             VR_LOG(LOG_ERROR, "Failed when accepting new connection");
             continue;
@@ -3495,7 +3920,7 @@ int do_tcp_relay_srv(char *host, int port) {
 
         VR_LOG(LOG_INFO, "Client connected to relay server...");
 
-        z = -1;
+        z = 0;
         while(z < MAX_CONCURRENT_CLIENTS) {
             if(tid[z] == 0)
                 break;
@@ -3520,6 +3945,11 @@ int do_tcp_relay_srv(char *host, int port) {
 end:
     z = 0;
     while(z < MAX_CONCURRENT_CLIENTS) {
+        if(tid[z] == 0) {
+            z++;
+            continue;
+        }
+            
         res = pthread_cancel(tid[z]);
         if(res != 0) {
             VR_LOG(LOG_ERROR, "Error trying to cancel thread...");
@@ -3532,6 +3962,8 @@ end:
         close_srv = 1;
         sleep(2);
     }
+    
+    close_srv = 1;
   
     return (err == 0);
 }
@@ -3553,6 +3985,7 @@ void start_relay_srv(arg_pass *arg) {
     proto = arg->proto;
 
     if(!relay_host || relay_port <= 0) {
+        VR_LOG(LOG_ERROR, "Invalid host or port provided for relay server");
         err = 1;
         goto end;
     }
@@ -3569,6 +4002,7 @@ void start_relay_srv(arg_pass *arg) {
     }
   
     if(r <= 0) {
+        VR_LOG(LOG_ERROR, "Unknown error in relay server");
         err = 1;
         goto end;
     }
@@ -3584,6 +4018,8 @@ end:
         close_srv = 1;
         sleep(2);
     }
+    
+    close_srv = 1;
   
     pthread_exit(NULL);
     return;
@@ -3604,8 +4040,10 @@ int __start_proxy_srv(char *proxy_host, int proxy_port) {
     arg->port = proxy_port;
     arg->proto = TCP_COM_PROTO;
      
-    if(pthread_create(&th, NULL, start_proxy_srv, (void *)arg))
+    if(pthread_create(&th, NULL, start_proxy_srv, (void *)arg)) {
+        VR_LOG(LOG_ERROR, "Error creating thread");
         return 0;
+    }
      
     return 1;
 }
@@ -3625,8 +4063,10 @@ int __start_relay_srv(char *relay_host, int relay_port, proto_t proto) {
     arg->port = relay_port;
     arg->proto = proto;
      
-    if(pthread_create(&th, NULL, start_relay_srv, (void *)arg))
+    if(pthread_create(&th, NULL, start_relay_srv, (void *)arg)) {
+        VR_LOG(LOG_ERROR, "Error creating thread");
         return 0;
+    }
      
     return 1;
 }
@@ -3689,57 +4129,68 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
     VR_LOG(LOG_INFO, "Starting VROUTE server version '%s'...", VROUTE_VERSION);
 
     if(!proxy_host || proxy_port <= 0) {
+        VR_LOG(LOG_ERROR, "Invalid host provided");
         fail = INVALID_PARAMETER;
         goto end;
     }
 
     if(!relay_host || relay_port <= 0) {
+        VR_LOG(LOG_ERROR, "Invalid port provided");
         fail = INVALID_PARAMETER;
         goto end;
     }
 
     if(proto != HTTPS_COM_PROTO && proto != HTTP_COM_PROTO &&
                     proto != TCP_COM_PROTO) {
+        VR_LOG(LOG_ERROR, "Unknown protocol requested for server");
         fail = INVALID_PARAMETER;
         goto end;
     }
   
     if(proto == HTTPS_COM_PROTO && !cert_file || strlen(cert_file) == 0) {
+        VR_LOG(LOG_ERROR, "HTTPS protocol requested, yet cert path not provided");
         fail = INVALID_PARAMETER;
         goto end;
     }
   
     if(proto == HTTPS_COM_PROTO && !file_exists(cert_file)) {
+        VR_LOG(LOG_ERROR, "HTTPS protocol requested, yet cert path does not exist");
         fail = INVALID_PARAMETER;
         goto end;
     }
   
     if(!key || key_sz == 0) {
+        VR_LOG(LOG_ERROR, "Key not provided and mandatory");
         fail = INVALID_PARAMETER;
         goto end;
     }
   
     if(key_sz > MAX_KEY_SIZE) {
+        VR_LOG(LOG_ERROR, "Key size exceeds maximum value");
         fail = INVALID_PARAMETER;
         goto end;
     }
 
     if(!is_valid_host_or_ip_addr(proxy_host)) {
+        VR_LOG(LOG_ERROR, "Provided proxy host is not valid");
         fail = INVALID_PARAMETER;
         goto end;
     }
 
     if(!is_valid_proxy_or_relay_port(proxy_port)) {
+        VR_LOG(LOG_ERROR, "Provided proxy port is not valid");
         fail = INVALID_PARAMETER;
         goto end;
     }
 
     if(!is_valid_host_or_ip_addr(relay_host)) {
+        VR_LOG(LOG_ERROR, "Provided relay host is not valid");
         fail = INVALID_PARAMETER;
         goto end;
     }
 
     if(!is_valid_proxy_or_relay_port(relay_port)) {
+        VR_LOG(LOG_ERROR, "Provided relay port is not valid");
         fail = INVALID_PARAMETER;
         goto end;
     }
@@ -3791,6 +4242,7 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
     VR_LOG(LOG_INFO, "Starting SOCKS proxy server at: %s:%d...", IN_ANY_ADDR, proxy_port);
   
     if(!__start_proxy_srv(proxy_host, proxy_port)) {
+        VR_LOG(LOG_ERROR, "Unknown error occurred while starting SOCKS proxy server");
         fail = SERVER_UNKNOWN_ERR;
         goto end;
     }
@@ -3798,6 +4250,7 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
     VR_LOG(LOG_INFO, "Starting relay server at: %s:%d...", IN_ANY_ADDR, relay_port);
   
     if(!__start_relay_srv(relay_host, relay_port, proto)) {
+        VR_LOG(LOG_ERROR, "Unknown error occurred while starting relay server");
         fail = SERVER_UNKNOWN_ERR;
         goto end;
     }
@@ -3807,9 +4260,11 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
     __ping_worker();
   
     while(1) {
-        if(close_srv)
+        if(close_srv) {
+            VR_LOG(LOG_INFO, "Order to close server. Closing...");
             break;
-        sleep(4);
+        }
+        sleep(2);
     }
 
     fail = 0;

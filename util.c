@@ -11,6 +11,8 @@
 
 #include "util.h"
 
+#define PREFIX_HEXDUMP_OUTPUT "[VROUTE] [DEBUG]"
+
 int file_exists(const char *path) {
     FILE *file = NULL;
 
@@ -28,6 +30,39 @@ int file_exists(const char *path) {
     return 0;
 }
 
+void __hexdump(char *func_name, char *tag, void *mem, size_t len) {
+    unsigned int i = 0, j = 0;
+    
+    if(!func_name, !tag || !mem || len == 0)
+        return;
+        
+    printf("\n%s %s: %s:\n\n", PREFIX_HEXDUMP_OUTPUT, func_name, tag);
+        
+    for(i = 0 ; i < len + ((len % HEXDUMP_COLS) ? (HEXDUMP_COLS - len % HEXDUMP_COLS) : 0) ; i++) {
+        if(i % HEXDUMP_COLS == 0)
+            printf("\t0x%06x: ", i);
+
+            if(i < len)
+                printf("%02x ", 0xFF & ((char*)mem)[i]);
+            else
+                printf("   ");
+
+            if(i % HEXDUMP_COLS == (HEXDUMP_COLS - 1)) {
+                for(j = i - (HEXDUMP_COLS - 1) ; j <= i ; j++) {
+                    if(j >= len)
+                        putchar(' ');
+                    else if(isprint(((char*)mem)[j]))
+                        putchar(0xFF & ((char*)mem)[j]);
+                    else
+                        putchar('.');
+                }
+                putchar('\n');
+            }
+    }
+    putchar('\n');
+    return;
+}
+
 void *memdup(const void *mem, size_t size) {
     void *out = calloc(size, sizeof(char));
     if(out != NULL)
@@ -43,6 +78,8 @@ ssize_t write_all(int sock, char **data, size_t *data_sz) {
 
     if(sock < 0 || !data || !data_sz)
         return -1;
+        
+    printf("writing %d bytes on sock\n", *data_sz);
 
     if(data && data_sz) {
         ptr = *data;
@@ -78,6 +115,8 @@ ssize_t read_all(int sock, char **data, size_t *data_sz) {
     #endif
     if(r < 0)
         return -1;
+        
+    printf("there are %d bytes available\n", bytes_available);
 
     if(bytes_available < 0) {
         *data = NULL;
