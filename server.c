@@ -4372,8 +4372,6 @@ char *socks4_rev_strerror(int err) {
     return str_err;
 }
 
-#define PSK "p@ssw0rd_3241!!=#"
-
 #if !COMPILE_AS_LIBRARY
 
 void usage(void) {
