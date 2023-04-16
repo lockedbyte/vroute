@@ -81,8 +81,6 @@ $ gcc -o server server.c -lssl -lcrypto -lpthread
 
 #define MAX_KEY_SIZE 64
 
-#define RELAY_BUFFER_SIZE 4096
-
 #define DATA_PREFIX "<img src='data:image/jpeg;base64,"
 #define DATA_SUFFIX "' />"
 
@@ -243,6 +241,7 @@ typedef struct __attribute__((packed)) _socks_hdr {
     uint8_t cd;
     uint16_t dstport;
     uint32_t dstip;
+    uint8_t null_c;
 } socks_hdr;
 
 typedef struct __attribute__((packed)) _tlv_header {
@@ -370,6 +369,13 @@ http_handshake_def *handshake_defs = NULL;
 conn_open_req *conn_req_glb = NULL;
 
 pthread_mutex_t glb_structure_lock;
+
+pthread_mutex_t proxy_glb_conn_lock;
+pthread_mutex_t client_glb_conn_lock;
+pthread_mutex_t handshake_glb_conn_lock;
+pthread_mutex_t queue_glb_buf_lock;
+pthread_mutex_t dead_client_worker;
+
 pthread_mutex_t iopen_lock;
 pthread_mutex_t route_open_lock;
 
@@ -385,7 +391,7 @@ void collect_dead_clients_worker(void) {
     time_t curr = time(NULL);
     long gap = 0;
     
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&dead_client_worker);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(client_conns[i].client_id != 0 && (client_conns[i].proto == HTTP_COM_PROTO ||
@@ -400,7 +406,7 @@ void collect_dead_clients_worker(void) {
         }
     }
     
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&dead_client_worker);
    
     return;
 }
@@ -494,7 +500,7 @@ int handshake_sess_exists(int h_id) {
     if(h_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&handshake_glb_conn_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -504,12 +510,11 @@ int handshake_sess_exists(int h_id) {
     }
 
     if(idx == -1) {
-        VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&handshake_glb_conn_lock);
         return 0;
     }
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&handshake_glb_conn_lock);
     return 1;
 }
 
@@ -530,7 +535,7 @@ int is_challenge_solved(int h_id) {
     if(h_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&handshake_glb_conn_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -541,17 +546,17 @@ int is_challenge_solved(int h_id) {
 
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&handshake_glb_conn_lock);
         return 0;
     }
    
     r = handshake_defs[idx].is_solved;
     if(r == 0) {
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&handshake_glb_conn_lock);
         return 0;
     }
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&handshake_glb_conn_lock);
     return 1;
 }
 
@@ -562,7 +567,7 @@ int is_challenge_failure(int h_id) {
     if(h_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&handshake_glb_conn_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -573,17 +578,17 @@ int is_challenge_failure(int h_id) {
 
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&handshake_glb_conn_lock);
         return 0;
     }
 
     r = handshake_defs[idx].fail;
     if(r == 0) {
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&handshake_glb_conn_lock);
         return 0;
     }
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&handshake_glb_conn_lock);
     return 1;
 }
 
@@ -593,7 +598,7 @@ int mark_challenge_solved(int h_id) {
     if(h_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&handshake_glb_conn_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -604,13 +609,13 @@ int mark_challenge_solved(int h_id) {
    
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&handshake_glb_conn_lock);
         return 0;
     }
 
     handshake_defs[idx].is_solved = 1;
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&handshake_glb_conn_lock);
     return 1;
 }
 
@@ -620,7 +625,7 @@ int mark_challenge_failure(int h_id) {
     if(h_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&handshake_glb_conn_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -631,13 +636,13 @@ int mark_challenge_failure(int h_id) {
    
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&handshake_glb_conn_lock);
         return 0;
     }
 
     handshake_defs[idx].fail = 1;
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&handshake_glb_conn_lock);
     return 1;
 }
 
@@ -652,7 +657,7 @@ int create_handshake(int h_id) {
     if(h_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&handshake_glb_conn_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == 0) {
@@ -663,7 +668,7 @@ int create_handshake(int h_id) {
    
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find free slot for handshake definition");
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&handshake_glb_conn_lock);
         return 0;
     }
    
@@ -672,7 +677,7 @@ int create_handshake(int h_id) {
     sol_a = encrypt_challenge((char *)chall, CHALLENGE_DEFAULT_SIZE, _key, _key_sz, &sol_size_a);
     if(!sol_a) {
         VR_LOG(LOG_ERROR, "Error trying to encrypt generated challenge");
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&handshake_glb_conn_lock);
         return 0;
     }
    
@@ -683,7 +688,7 @@ int create_handshake(int h_id) {
             sol_a = NULL;
         }
         VR_LOG(LOG_ERROR, "Error hashing solution in SHA-256");
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&handshake_glb_conn_lock);
         return NULL;
     }
 
@@ -699,7 +704,7 @@ int create_handshake(int h_id) {
     handshake_defs[idx].is_solved = 0;
     handshake_defs[idx].fail = 0;
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&handshake_glb_conn_lock);
     return 1;
 }
 
@@ -709,7 +714,7 @@ int delete_handshake(int h_id) {
     if(h_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&handshake_glb_conn_lock);
    
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -720,7 +725,7 @@ int delete_handshake(int h_id) {
    
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&handshake_glb_conn_lock);
         return 0;
     }
    
@@ -740,7 +745,7 @@ int delete_handshake(int h_id) {
 
     handshake_defs[idx].sol_size = 0;
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&handshake_glb_conn_lock);
     return 1;
 }
 
@@ -751,7 +756,7 @@ char *get_challenge(int h_id) {
     if(h_id <= 0)
         return NULL;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&handshake_glb_conn_lock);
    
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -762,13 +767,13 @@ char *get_challenge(int h_id) {
 
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&handshake_glb_conn_lock);
         return NULL;
     }
 
     chall = handshake_defs[idx].challenge;
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&handshake_glb_conn_lock);
     return chall;
 }
 
@@ -782,7 +787,7 @@ char *get_h_challenge_solution(int h_id, size_t *out_size) {
 
     *out_size = 0;
     
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&handshake_glb_conn_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(handshake_defs[i].h_id == h_id) {
@@ -793,14 +798,14 @@ char *get_h_challenge_solution(int h_id, size_t *out_size) {
 
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find handshake definition with handshake sess ID: %d", h_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&handshake_glb_conn_lock);
         return NULL;
     }
 
     sol = handshake_defs[idx].solution;
     sol_size = handshake_defs[idx].sol_size;
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&handshake_glb_conn_lock);
     
     *out_size = sol_size;
     return sol;
@@ -815,7 +820,7 @@ int create_channel(int client_id, int proxy_sock, char *host, int port) {
     if(client_id <= 0 || proxy_sock < 0 || !host || port <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&client_glb_conn_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(client_conns[i].client_id == client_id) {
@@ -826,7 +831,7 @@ int create_channel(int client_id, int proxy_sock, char *host, int port) {
    
     if(c_idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find client connection with client ID: %d", client_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
    
@@ -839,7 +844,7 @@ int create_channel(int client_id, int proxy_sock, char *host, int port) {
    
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find free slot for channel definition");
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
 
@@ -856,7 +861,7 @@ int create_channel(int client_id, int proxy_sock, char *host, int port) {
     client_conns[c_idx].c_channels[idx].dst_port = (int16_t)port;
     client_conns[c_idx].c_channels[idx].proxy_client_sock = proxy_sock;
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&client_glb_conn_lock);
     return channel_id;
 }
 
@@ -868,7 +873,7 @@ int create_channel_custom(int channel_id, int client_id, int proxy_sock, char *h
     if(client_id <= 0 || proxy_sock < 0 || !host || port <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    //pthread_mutex_lock(&client_glb_conn_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(client_conns[i].client_id == client_id) {
@@ -879,7 +884,7 @@ int create_channel_custom(int channel_id, int client_id, int proxy_sock, char *h
    
     if(c_idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find client connection with client ID: %d", client_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+       // pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
    
@@ -892,7 +897,7 @@ int create_channel_custom(int channel_id, int client_id, int proxy_sock, char *h
    
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find free slot for channel definition");
-        pthread_mutex_unlock(&glb_structure_lock);
+      // pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
 
@@ -904,7 +909,7 @@ int create_channel_custom(int channel_id, int client_id, int proxy_sock, char *h
     client_conns[c_idx].c_channels[idx].dst_port = (int16_t)port;
     client_conns[c_idx].c_channels[idx].proxy_client_sock = proxy_sock;
 
-    pthread_mutex_unlock(&glb_structure_lock);
+   // pthread_mutex_unlock(&client_glb_conn_lock);
     return channel_id;
 }
 
@@ -917,7 +922,7 @@ int close_channel(int channel_id, int is_client_req) {
         
     puts("AAAAA");
         
-    pthread_mutex_lock(&glb_structure_lock);
+   // pthread_mutex_lock(&client_glb_conn_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
@@ -933,7 +938,7 @@ int close_channel(int channel_id, int is_client_req) {
    
     if(idx == -1 || c_idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find channel definition with channel ID: %d", channel_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+      //  pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
     
@@ -954,17 +959,18 @@ int close_channel(int channel_id, int is_client_req) {
     if(!is_client_req) {
         if(!send_remote_cmd(CHANNEL_CLOSE_CMD, channel_id)) {
             VR_LOG(LOG_ERROR, "Error sending remote cmd 'CHANNEL_CLOSE_CMD' to channel ID: %d", channel_id);
-            pthread_mutex_unlock(&glb_structure_lock);
+     //       pthread_mutex_unlock(&client_glb_conn_lock);
             return 0;
         }
     }
     
     puts("eeeeee");
   
-    pthread_mutex_unlock(&glb_structure_lock);
+ //   pthread_mutex_unlock(&client_glb_conn_lock);
     return 1;
 }
 
+/* XXX: locking relies on caller */
 int channel_exists(int channel_id) {
     int idx = -1;
     int c_idx = -1;
@@ -972,7 +978,7 @@ int channel_exists(int channel_id) {
     if(channel_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    puts("4346634qsd");
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
@@ -983,13 +989,15 @@ int channel_exists(int channel_id) {
             }
         }
     }
+    
+    puts("4346634yyyyyyyyyyyyyyyyyyyyyyyyyyyyyqsd");
    
     if(idx == -1 || c_idx == -1) {
-        pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
+    
+    puts("87dzx3");
    
-    pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
@@ -1001,7 +1009,7 @@ int get_client_by_channel_id(int channel_id) {
     if(channel_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&client_glb_conn_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
@@ -1015,13 +1023,13 @@ int get_client_by_channel_id(int channel_id) {
    
     if(idx == -1 || c_idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find channel definition with channel ID: %d", channel_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
    
     client_id = client_conns[c_idx].c_channels[idx].client_id;
    
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&client_glb_conn_lock);
     return client_id;
 }
 
@@ -1033,7 +1041,7 @@ int get_proxy_sock_by_channel_id(int channel_id) {
     if(channel_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&client_glb_conn_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
@@ -1047,13 +1055,13 @@ int get_proxy_sock_by_channel_id(int channel_id) {
    
     if(idx == -1 || c_idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find channel definition with channel ID: %d", channel_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
    
     proxy_client_sock = client_conns[c_idx].c_channels[idx].proxy_client_sock;
     
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&client_glb_conn_lock);
     return proxy_client_sock;
 }
 
@@ -1065,7 +1073,7 @@ int is_channel_by_client(int client_id, int channel_id) {
     if(client_id <= 0 || channel_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&client_glb_conn_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
@@ -1078,18 +1086,18 @@ int is_channel_by_client(int client_id, int channel_id) {
     }
    
     if(idx == -1 || c_idx == -1) {
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
    
     cid = client_conns[c_idx].c_channels[idx].client_id;
    
     if(cid != client_id) {
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
    
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&client_glb_conn_lock);
     return 1;
 }
 
@@ -1120,7 +1128,7 @@ int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
     int32_t client_ip_addr = 0;
     channel_def *c_channels = NULL;
    
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&client_glb_conn_lock);
    
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(client_conns[i].client_id == 0) {
@@ -1131,7 +1139,7 @@ int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
    
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find client connection with client ID: %d", client_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
   
@@ -1145,7 +1153,7 @@ int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
   
     c_channels = (channel_def *)calloc(MAX_CONCURRENT_CHANNELS_PER_CLIENT, sizeof(channel_def));
     if(!c_channels) {
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
   
@@ -1157,7 +1165,7 @@ int create_client(int sock, char *client_ip, int client_port, proto_t proto) {
     client_conns[idx].orig_port = (int16_t)client_port;
     client_conns[idx].c_channels = c_channels;
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&client_glb_conn_lock);
     return client_id;
 }
 
@@ -1168,7 +1176,7 @@ int close_client(int client_id) {
     if(client_id <= 0)
         return 0;
         
-    //pthread_mutex_lock(&glb_structure_lock);
+  //  pthread_mutex_lock(&client_glb_conn_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(client_conns[i].client_id == client_id) {
@@ -1179,7 +1187,7 @@ int close_client(int client_id) {
    
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find client connection with client ID: %d", client_id);
-        //pthread_mutex_unlock(&glb_structure_lock);
+   //     pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
    
@@ -1213,7 +1221,7 @@ int close_client(int client_id) {
         client_conns[idx].sock = -1;
     }
   
-    //pthread_mutex_unlock(&glb_structure_lock);
+ //   pthread_mutex_unlock(&client_glb_conn_lock);
     return 1;
 }
 
@@ -1223,7 +1231,7 @@ int update_last_conn_time(int client_id) {
     if(client_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&client_glb_conn_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(client_conns[i].client_id == client_id) {
@@ -1234,13 +1242,13 @@ int update_last_conn_time(int client_id) {
    
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find client connection with client ID: %d", client_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
    
     client_conns[idx].last_conn_timestamp = time(NULL);
   
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&client_glb_conn_lock);
     return 1;
 }
 
@@ -1268,8 +1276,6 @@ int proxy_client_exists(int proxy_client_id) {
    
     if(proxy_client_id <= 0)
         return 0;
-        
-    //pthread_mutex_lock(&glb_structure_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
         if(proxy_client_conns[i].proxy_client_id == proxy_client_id) {
@@ -1279,12 +1285,9 @@ int proxy_client_exists(int proxy_client_id) {
     }
    
     if(idx == -1) {
-        VR_LOG(LOG_ERROR, "Could not find proxy client connection with proxy client ID: %d", proxy_client_id);
-        //pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
-     
-    //pthread_mutex_unlock(&glb_structure_lock); 
+    
     return 1;
 }
 
@@ -1296,7 +1299,7 @@ int create_proxy_client(int sock, char *client_ip, int client_port, int channel_
     if(sock < 0 || channel_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&proxy_glb_conn_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
         if(proxy_client_conns[i].proxy_client_id == 0) {
@@ -1307,7 +1310,7 @@ int create_proxy_client(int sock, char *client_ip, int client_port, int channel_
    
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find free slot for proxy client connection");
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&proxy_glb_conn_lock);
         return 0;
     }
 
@@ -1325,7 +1328,7 @@ int create_proxy_client(int sock, char *client_ip, int client_port, int channel_
     proxy_client_conns[idx].orig_port = (int16_t)client_port;
     proxy_client_conns[idx].channel_id = channel_id;
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&proxy_glb_conn_lock);
     return proxy_client_id;
 }
 
@@ -1335,7 +1338,7 @@ int close_proxy_client(int proxy_client_id) {
     if(proxy_client_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&proxy_glb_conn_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
         if(proxy_client_conns[i].proxy_client_id == proxy_client_id) {
@@ -1346,7 +1349,7 @@ int close_proxy_client(int proxy_client_id) {
    
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find proxy client connection with proxy client ID: %d", proxy_client_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&proxy_glb_conn_lock);
         return 0;
     }
 
@@ -1360,7 +1363,7 @@ int close_proxy_client(int proxy_client_id) {
         proxy_client_conns[idx].sock = -1;
     }
   
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&proxy_glb_conn_lock);
     return 1;
 }
 
@@ -1371,7 +1374,7 @@ int get_channel_by_proxy_client_id(int proxy_client_id) {
     if(proxy_client_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&proxy_glb_conn_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
         if(proxy_client_conns[i].proxy_client_id == proxy_client_id) {
@@ -1382,13 +1385,13 @@ int get_channel_by_proxy_client_id(int proxy_client_id) {
 
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find proxy client connection with proxy client ID: %d", proxy_client_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&proxy_glb_conn_lock);
         return 0;
     }
    
     channel_id = proxy_client_conns[idx].channel_id;
     
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&proxy_glb_conn_lock);
     return channel_id;
 }
 
@@ -1399,7 +1402,7 @@ int get_sock_by_proxy_client_id(int proxy_client_id) {
     if(proxy_client_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&proxy_glb_conn_lock);
      
     for(int i = 0 ; i < MAX_CONCURRENT_PROXY_CLIENTS ; i++) {
         if(proxy_client_conns[i].proxy_client_id == proxy_client_id) {
@@ -1410,13 +1413,13 @@ int get_sock_by_proxy_client_id(int proxy_client_id) {
 
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find proxy client connection with proxy client ID: %d", proxy_client_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&proxy_glb_conn_lock);
         return 0;
     }
    
     sock = proxy_client_conns[idx].sock;
    
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&proxy_glb_conn_lock);
     return sock;
 }
 
@@ -1427,7 +1430,7 @@ int get_relay_sock_by_client_id(int client_id) {
     if(client_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&client_glb_conn_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         if(client_conns[i].client_id == client_id) {
@@ -1438,13 +1441,13 @@ int get_relay_sock_by_client_id(int client_id) {
 
     if(idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find client connection with client ID: %d", client_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
 
     sock = client_conns[idx].sock;
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&client_glb_conn_lock);
     return sock;
 }
 
@@ -1455,8 +1458,6 @@ int queue_exists(int queue_id) {
 
     if(queue_id <= 0)
         return 0;
-        
-    //pthread_mutex_lock(&glb_structure_lock);
 
     p = queue_head;
     while(p) {
@@ -1468,11 +1469,9 @@ int queue_exists(int queue_id) {
     }
 
     if(!found) {
-        //pthread_mutex_unlock(&glb_structure_lock);
         return 0;
     }
 
-    //pthread_mutex_unlock(&glb_structure_lock);
     return 1;
 }
 
@@ -1485,7 +1484,7 @@ int queue_data(int client_id, char *data, size_t data_sz, time_t timestamp) {
     if(client_id <= 0 || !data || data_sz == 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&queue_glb_buf_lock);
       
     while(queue_id = generate_queue_id()) {
         if(!queue_exists(queue_id))
@@ -1494,7 +1493,7 @@ int queue_data(int client_id, char *data, size_t data_sz, time_t timestamp) {
       
     qbuf = (buffer_queue *)calloc(sizeof(buffer_queue) + data_sz, sizeof(char));
     if(!qbuf) {
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&queue_glb_buf_lock);
         return 0;
     }
     qbuf_data = &qbuf->data[0];
@@ -1518,14 +1517,14 @@ int queue_data(int client_id, char *data, size_t data_sz, time_t timestamp) {
 
         if(p->next != NULL) {
             VR_LOG(LOG_ERROR, "Rare behaviour: p->next != NULL");
-            pthread_mutex_unlock(&glb_structure_lock);
+            pthread_mutex_unlock(&queue_glb_buf_lock);
             return 0;
         }
 
         p->next = qbuf;
     }
 
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&queue_glb_buf_lock);
     return queue_id;
 }
 
@@ -1539,7 +1538,7 @@ int remove_queued_data(int queue_id) {
     if(queue_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&queue_glb_buf_lock);
    
     prev = NULL;
     p = queue_head;
@@ -1554,7 +1553,7 @@ int remove_queued_data(int queue_id) {
 
     if(!found) {
         VR_LOG(LOG_ERROR, "Could not find queued data with queue_id: %d", queue_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&queue_glb_buf_lock);
         return 0;
     }
 
@@ -1581,7 +1580,7 @@ int remove_queued_data(int queue_id) {
         qbuf = NULL;
     }
     
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&queue_glb_buf_lock);
     return 1;
 }
 
@@ -1599,7 +1598,7 @@ char *get_queued_data(int queue_id, size_t *out_size) {
      
     *out_size = 0;
     
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&queue_glb_buf_lock);
    
     prev = NULL;
     p = queue_head;
@@ -1614,7 +1613,7 @@ char *get_queued_data(int queue_id, size_t *out_size) {
    
     if(!found) {
         VR_LOG(LOG_INFO, "No queue_id (%d) found with data in queue", queue_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&queue_glb_buf_lock);
         return 0;
     }
       
@@ -1630,7 +1629,7 @@ char *get_queued_data(int queue_id, size_t *out_size) {
    
     out = memdup(qbuf_data, qbuf->size);
     if(!out) {
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&queue_glb_buf_lock);
         return NULL;
     }
     data_size = qbuf->size;
@@ -1648,7 +1647,7 @@ char *get_queued_data(int queue_id, size_t *out_size) {
         qbuf = NULL;
     }
     
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&queue_glb_buf_lock);
   
     *out_size = data_size;
      
@@ -1669,7 +1668,7 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
      
     *out_size = 0;
     
-    pthread_mutex_lock(&glb_structure_lock);
+    pthread_mutex_lock(&queue_glb_buf_lock);
    
     prev = NULL;
     p = queue_head;
@@ -1684,7 +1683,7 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
 
     if(!found) {
         VR_LOG(LOG_INFO, "No data for client ID (%d) in data queue", client_id);
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&queue_glb_buf_lock);
         return NULL;
     }
       
@@ -1700,7 +1699,7 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
 
     out = memdup(qbuf_data, qbuf->size);
     if(!out) {
-        pthread_mutex_unlock(&glb_structure_lock);
+        pthread_mutex_unlock(&queue_glb_buf_lock);
         return NULL;
     }
     data_size = qbuf->size;
@@ -1718,7 +1717,7 @@ char *get_next_queued_data(int client_id, size_t *out_size) {
         qbuf = NULL;
     }
     
-    pthread_mutex_unlock(&glb_structure_lock);
+    pthread_mutex_unlock(&queue_glb_buf_lock);
   
     *out_size = data_size;
      
@@ -1848,7 +1847,7 @@ int send_remote_cmd(scmd_t cmd, int channel_id) {
     return 1;
 }
 
-int interpret_remote_packet(int client_id, char *data, size_t data_sz) {
+int __interpret_remote_packet(int client_id, char *data, size_t data_sz) {
     int channel_id = 0;
     int cid = 0;
     size_t tlv_sz = 0;
@@ -1949,23 +1948,34 @@ int interpret_remote_packet(int client_id, char *data, size_t data_sz) {
                     VR_LOG(LOG_DEBUG, "Received FORWARD_CONNECTION_FAILURE for channel_id: %d", cmd_p->channel_id);
                 }
                 
+                puts("hdethzsdetjh");
+                
                 if(channel_exists(cmd_p->channel_id)) {
                     VR_LOG(LOG_WARN, "Channel ID %d already exists", cmd_p->channel_id);
                     if(!found) {
+                        puts("wwwwvdfndgfn");
                         if(!close_channel(cmd_p->channel_id, 1)) {
                             VR_LOG(LOG_ERROR, "Error trying to close channel ID: %d", cmd_p->channel_id);
                             return 0;
                         }
+                        puts("w666666666666666666666dgfn");
                         return 1;
                     }
                     VR_LOG(LOG_ERROR, "Channel already opened, we are not supposed to receive FORWARD_CONNECTION_SUCCESS messages");
                     return 0;
                 }
                 
+                if(!is_route_discovery_in_process())
+                    return 1;
+                
+                puts("4y34qwygasr");
+                
                 if(is_client_in_checked_list(cmd_p->channel_id)) {
                     VR_LOG(LOG_INFO, "This client has already been checked: No access to requested destination");
                     return 1;
                 }
+                
+                puts("rrrrrhaehgashgas");
                 
                 if(!mark_route_found(client_id, cmd_p->channel_id, found)) {
                     VR_LOG(LOG_ERROR, "Could not mark route as found");
@@ -1996,6 +2006,96 @@ int interpret_remote_packet(int client_id, char *data, size_t data_sz) {
         }
     }
   
+    return 1;
+}
+
+size_t get_real_size_pad(size_t size, int bs) {
+    if((size % bs) == 0)
+        return size + bs;
+    return size + (bs - (size % bs));
+}
+
+int interpret_remote_packet(int client_id, char *data, size_t data_sz) {
+    tlv_header *tlv = NULL;
+    size_t rmndr_sz = 0;
+    size_t curr_pkt_sz = 0;
+    char *p = NULL;
+    int success = 0;
+    size_t real_size = 0;
+    char *unpadded = NULL;
+    size_t unpadded_sz = 0;
+    int i = 0;
+    
+    if(client_id <= 0 || !data || data_sz == 0)
+        return 0;
+        
+    if(data_sz < sizeof(tlv_header))
+        return 0;
+        
+    VR_LOG(LOG_DEBUG, "Starting unpacking of received data packets...");
+    
+    p = data;
+    rmndr_sz = data_sz;
+    while(rmndr_sz > 0) {
+        i++;
+        
+        if(rmndr_sz < sizeof(tlv_header)) {
+            VR_LOG(LOG_ERROR, "Remaining size less than tlv header size...");
+            break;
+        }
+
+        tlv = (tlv_header *)p;
+        
+        curr_pkt_sz = tlv->tlv_data_len;
+        if(curr_pkt_sz > (rmndr_sz - sizeof(tlv_header))) {
+            VR_LOG(LOG_ERROR, "Packet size exceeds bounds (pkt size: %ld, rmndr_sz: %ld)...", curr_pkt_sz, rmndr_sz);
+            break;
+        }
+            
+        VR_LOG(LOG_DEBUG, "Packet #%d with data length: %d", i, curr_pkt_sz);
+        
+        if(rmndr_sz > sizeof(tlv_header) + curr_pkt_sz) {
+            real_size = get_real_size_pad(sizeof(tlv_header) + curr_pkt_sz, 16);
+            
+            VR_LOG(LOG_DEBUG, "Package is likely to be padded: real size: %d", real_size);
+            
+            unpadded = PKCS7_unpad(p, real_size, 16, &unpadded_sz);
+            if(unpadded) {
+                hexdump("packet", unpadded, unpadded_sz);
+                
+                VR_LOG(LOG_DEBUG, "PKCS7 unpadding worked, interpreting packet...");
+                if(__interpret_remote_packet(client_id, unpadded, unpadded_sz))
+                    success = 1;
+                
+                // XXX: make sure about the assumption
+                p += (real_size + AES_BLOCK_SIZE);
+                rmndr_sz -= (real_size + AES_BLOCK_SIZE);
+                continue;
+            }
+            
+            VR_LOG(LOG_DEBUG, "Unpadding did NOT work, fallbacking to normal interpreting...");
+        }
+        
+        hexdump("packet", p, sizeof(tlv_header) + curr_pkt_sz);
+        
+        VR_LOG(LOG_DEBUG, "Interpreting packet...");
+        
+        if(__interpret_remote_packet(client_id, p, sizeof(tlv_header) + curr_pkt_sz))
+            success = 1;
+            
+        p += (sizeof(tlv_header) + curr_pkt_sz);
+        rmndr_sz -= (sizeof(tlv_header) + curr_pkt_sz);
+    }
+    
+    if(rmndr_sz > 0) {
+        VR_LOG(LOG_WARN, "There are %d bytes of remainder in the received data...", rmndr_sz);
+    }
+    
+    if(!success) {
+        VR_LOG(LOG_ERROR, "None of the interpreted packets succeed...");
+        return 0;
+    }
+        
     return 1;
 }
 
@@ -2323,6 +2423,8 @@ int relay_tcp_srv_poll(int sock) {
                     err = 1;
                     goto end;
                 }
+                
+                puts(",kj,j,,,,,,");
 
             } else if((fds[0].revents & POLLHUP) != 0) { /* conn closed */
                 if(cid) {
@@ -2377,13 +2479,18 @@ ssize_t http_write_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int i
     char *ptr = NULL;
     size_t sz = 0;
 
-    if(sock < 0 || !c_ssl || !data || !data_sz)
+    if(sock < 0 || !data || !data_sz)
+        return -1;
+        
+    if(is_https && !c_ssl)
         return -1;
 
     if(data && data_sz) {
         ptr = *data;
         sz = *data_sz;
     }
+    
+    VR_LOG(LOG_DEBUG, "Sending %ld bytes of data...", sz);
 
     while(sent < sz) {
         if(is_https)
@@ -2396,6 +2503,8 @@ ssize_t http_write_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int i
         }
         sent += r;
     }
+    
+    VR_LOG(LOG_DEBUG, "%ld bytes of data successfully sent...", sent);
 
     return sent;
 }
@@ -2411,7 +2520,10 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
     int s_fd = -1;
     int sock_m = -1;
 
-    if(sock < 0 || !c_ssl || !data || !data_sz)
+    if(sock < 0 || !data || !data_sz)
+        return -1;
+        
+    if(is_https && !c_ssl)
         return -1;
 
     *data = NULL;
@@ -2449,6 +2561,8 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
         *data_sz = 0;
         return 0;
     }
+    
+    VR_LOG(LOG_DEBUG, "There are %ld bytes available", bytes_available);
 
     ptr = calloc(bytes_available + 1, sizeof(char));
     if(!ptr)
@@ -2572,6 +2686,8 @@ char *get_data_from_http(char *data, size_t data_sz, size_t *out_size) {
         return NULL;
     }
     
+    hexdump("original HTTP request", data, data_sz);
+    
     p2 = strstr(p, DATA_INPUT_PREFIX);
     if(!p2) {
         if(p) {
@@ -2581,7 +2697,7 @@ char *get_data_from_http(char *data, size_t data_sz, size_t *out_size) {
         VR_LOG(LOG_ERROR, "Could not find HTTP request prefix");
         return NULL;
     }
-    p2 += sizeof(DATA_INPUT_PREFIX);
+    p2 += strlen(DATA_INPUT_PREFIX);
    
     p3 = strstr(p2, DATA_INPUT_SUFFIX);
     if(!p3) {
@@ -2594,9 +2710,12 @@ char *get_data_from_http(char *data, size_t data_sz, size_t *out_size) {
     }
    
     *p3 = 0;
+    
+    if(p2[strlen(p2) - 1] == 0x0a)
+        p2[strlen(p2) - 1] = '\0';
  
     raw = base64_decode(p2, strlen(p2), &raw_sz);
-    if(raw) {
+    if(!raw) {
         if(p) {
             free(p);
             p = NULL;
@@ -2817,7 +2936,11 @@ int issue_connection_open(int proxy_sock, uint32_t ip_addr, uint16_t port) {
     time_t curr_time = 0;
     struct in_addr i_addr;
     
+    puts("pre iopen lock");
+    
     pthread_mutex_lock(&iopen_lock);
+
+    puts("post iopen lock");
     
     if(conn_req_glb) {
         VR_LOG(LOG_WARN, "conn_req_glb is not NULL and it should be...");
@@ -2984,7 +3107,7 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
         cid = param;
         if(req_type == DATA_SENDING_TYPE) {
             enc = get_data_from_http(data, data_sz, &enc_sz);
-            if(enc || enc_sz == 0) {
+            if(!enc || enc_sz == 0) {
                 VR_LOG(LOG_ERROR, "Error trying to get data from HTTP request");
                 err = 1;
                 goto end;
@@ -3067,6 +3190,8 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
         if(handshake_sess_exists(h_id)) {
             if(is_challenge_solved(h_id) || is_challenge_failure(h_id)) {
                 if(is_challenge_solved(h_id)) {
+                    VR_LOG(LOG_DEBUG, "Challenge is solved, creating client global def...");
+                    
                     cid = create_client(-1, NULL, 0, _proto);
                     if(cid <= 0) {
                         VR_LOG(LOG_ERROR, "Error trying to create a new client");
@@ -3090,19 +3215,25 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
                 err = 0;
                 goto end;
             } else {
+                VR_LOG(LOG_DEBUG, "Getting HTTP request data...");
+                
                 raw = get_data_from_http(data, data_sz, &raw_sz);
-                if(raw || raw_sz == 0) {
+                if(!raw || raw_sz == 0) {
                     VR_LOG(LOG_ERROR, "Error trying to get raw data");
                     err = 1;
                     goto end;
                 }
-		  
+		
+		VR_LOG(LOG_DEBUG, "Retrieving original challenge solution...");
+		
                 real_sol = get_h_challenge_solution(h_id, &real_sol_sz);
                 if(!real_sol) {
                     VR_LOG(LOG_ERROR, "Error trying to get the challenge saved solution");
                     err = 1;
                     goto end;
                 }
+                
+                VR_LOG(LOG_DEBUG, "Checking client solution...");
 		  
                 if(raw_sz == real_sol_sz && (memcmp(raw, real_sol, raw_sz) == 0)) {
                     VR_LOG(LOG_INFO, "Challenge solution provided by client is correct");
@@ -3128,11 +3259,15 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
                 return NULL;
             }
         } else {
+            VR_LOG(LOG_DEBUG, "Creating handshake global def...");
+            
             if(!create_handshake(h_id)) {
                 VR_LOG(LOG_ERROR, "Error trying to create handshake");
                 err = 1;
                 goto end;
             }
+            
+            VR_LOG(LOG_DEBUG, "Retrieving challenge...");
              
             chall = get_challenge(h_id);
             if(!chall) {
@@ -3140,6 +3275,8 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
                 err = 1;
                 goto end;
             }
+            
+            VR_LOG(LOG_DEBUG, "Crafting HTTP response with challenge...");
              
             out = get_http_data_response(chall, CHALLENGE_DEFAULT_SIZE, &osz);
             if(!out || osz == 0) {
@@ -3147,6 +3284,8 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
                 err = 1;
                 goto end;
             }
+            
+            hexdump("HTTP response", out, osz);
              
             err = 0;
             goto end;
@@ -3231,6 +3370,8 @@ int relay_http_srv_handle_req(rl_arg_pass *arg) {
         err = 1;
         goto end;
     }
+    
+    puts("AAA");
   
     err = 0;
 end:
@@ -3273,7 +3414,6 @@ void proxy_srv_poll(int sock) {
     int res = 0;
     char socks_hdr_buf[sizeof(socks_hdr) + 1] = { 0 };
     struct pollfd fds[1] = { -1 };
-    char tmp_buffer[RELAY_BUFFER_SIZE + 1] = { 0 };
     int client_id = 0;
     int channel_id = 0;
     char *p = NULL;
@@ -3287,6 +3427,8 @@ void proxy_srv_poll(int sock) {
     char *enc = NULL;
     size_t enc_sz = 0;
     int no_ccleanup = 0;
+    char *rdata = NULL;
+    size_t rdata_sz = 0;
    
     if(sock < 0) {
         err = 1;
@@ -3334,7 +3476,7 @@ void proxy_srv_poll(int sock) {
     
     channel_id = issue_connection_open(sock, ip_addr_i, port);
     if(channel_id <= 0) {
-        r = write(sock, SOCKS_REPLY_FAILURE, sizeof(SOCKS_REPLY_FAILURE));
+        r = write(sock, SOCKS_REPLY_FAILURE, 8);
         if(r < 0) {
            VR_LOG(LOG_ERROR, "Error when replying to SOCKS proxy client");
            err = 1;
@@ -3343,7 +3485,7 @@ void proxy_srv_poll(int sock) {
         err = 1;
         goto end;
     } else {
-        r = write(sock, SOCKS_REPLY_SUCCESS, sizeof(SOCKS_REPLY_FAILURE));
+        r = write(sock, SOCKS_REPLY_SUCCESS, 8);
         if(r < 0) {
            VR_LOG(LOG_ERROR, "Error when replying to SOCKS proxy client");
            err = 1;
@@ -3367,13 +3509,12 @@ void proxy_srv_poll(int sock) {
   
     while(1) {
         if(!channel_exists(channel_id)) {
+            VR_LOG(LOG_INFO, "Channel ID not anymore registered, closing connection poll...");
             no_ccleanup = 1;
             close(sock);
             err = 0;
             goto end;
         }
-        
-        memset(tmp_buffer, 0, RELAY_BUFFER_SIZE);
      
         res = poll(fds, 1, POLL_TIMEOUT);
         if(res == -1) {
@@ -3384,21 +3525,22 @@ void proxy_srv_poll(int sock) {
             continue;
         } else {
             if(fds[0].revents & POLLIN) {
-                r = read(sock, tmp_buffer, RELAY_BUFFER_SIZE);
-                if(r < 0) {
+                rx = read_all(sock, &rdata, &rdata_sz);
+                if(rx < 0) {
                     VR_LOG(LOG_ERROR, "Error when receiving data from SOCKS proxy client");
                     err = 1;
                     goto end;
-                } else if(r == 0) { /* conn closed */
+                } else if(rx == 0) { /* conn closed */
+                    VR_LOG(LOG_INFO, "Connection closed, exiting from connection poll...");
                     err = 0;
                     goto end;
                 }
                 
                 VR_LOG(LOG_DEBUG, "Received %d bytes from SOCKS proxy client...", r);
                 
-                hexdump("proxy client received data", tmp_buffer, r);
+                hexdump("proxy client received data", rdata, rdata_sz);
             
-                p = pack_proxy_data(channel_id, tmp_buffer, r, &p_sz);
+                p = pack_proxy_data(channel_id, rdata, rdata_sz, &p_sz);
                 if(!p) {
                     VR_LOG(LOG_ERROR, "Error trying to pack raw data into tlv_header");
                     err = 1;
@@ -3460,6 +3602,7 @@ void proxy_srv_poll(int sock) {
                 }
             
             } else if((fds[0].revents & POLLHUP) != 0) { /* conn closed */
+                VR_LOG(LOG_INFO, "Connection closed, exiting from connection poll (1)...");
                 err = 0;
                 goto end;
             }
@@ -3470,7 +3613,8 @@ void proxy_srv_poll(int sock) {
     
     err = 0;
 end:
-       
+    VR_LOG(LOG_INFO, "Finishing proxy server poll. Cleaning up...");
+    
     if(!no_ccleanup && channel_id != 0 && !send_remote_cmd(CHANNEL_CLOSE_CMD, channel_id)) {
         VR_LOG(LOG_ERROR, "Error sending CHANNEL_CLOSE_CMD to the remote end with channel ID: %d", channel_id);
         err = 1;
@@ -3760,12 +3904,14 @@ int do_http_relay_srv(char *host, int port) {
             continue;
         }
      
-        c_ssl = SSL_new(_ctx);
-        SSL_set_fd(c_ssl, connfd);
+        if(is_https) {
+            c_ssl = SSL_new(_ctx);
+            SSL_set_fd(c_ssl, connfd);
      
-        if(SSL_accept(c_ssl) <= 0) {
-            VR_LOG(LOG_ERROR, "Error accepting SSL connection");
-            continue;
+            if(SSL_accept(c_ssl) <= 0) {
+                VR_LOG(LOG_ERROR, "Error accepting SSL connection");
+                continue;
+            }
         }
 
         VR_LOG(LOG_INFO, "Client connected to relay server...");
@@ -4272,7 +4418,7 @@ end:
     if(fail)
         VR_LOG(LOG_INFO, "Closing VROUTE server. Status: FAILURE");
     else
-        VR_LOG(LOG_INFO, "Closing VROUTE server. Statur: NORMAL");
+        VR_LOG(LOG_INFO, "Closing VROUTE server. Status: NORMAL");
     
     if(fail == 0) {
         if(err)
@@ -4334,7 +4480,7 @@ int main(void) {
     int err = 0;
     // note: NULL is allowed for &err arg
     // generate error codes and a translate-to-error-string table on socks4_rev_strerror() to get error information
-    if(!start_socks4_rev_proxy("127.0.0.1", 1080, "127.0.0.1", 1337, TCP_COM_PROTO, PSK, strlen(PSK), "./cert.pem", &err)) {
+    if(!start_socks4_rev_proxy("127.0.0.1", 1080, "127.0.0.1", 1337, HTTP_COM_PROTO, PSK, strlen(PSK), "./cert.pem", &err)) {
         VR_LOG(LOG_ERROR, "Error.: Server failed. (%d): %s\n", err, socks4_rev_strerror(err));
         return 1;
     }

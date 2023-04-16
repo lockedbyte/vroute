@@ -13,6 +13,8 @@
 
 #define PREFIX_HEXDUMP_OUTPUT "[VROUTE] [DEBUG]"
 
+#define CONN_TIMEOUT 4
+
 int file_exists(const char *path) {
     FILE *file = NULL;
 
@@ -64,7 +66,7 @@ void __hexdump(char *func_name, char *tag, void *mem, size_t len) {
 }
 
 void *memdup(const void *mem, size_t size) {
-    void *out = calloc(size, sizeof(char));
+    void *out = calloc(size + 1, sizeof(char));
     if(out != NULL)
         memcpy(out, mem, size);
     return out;
@@ -75,6 +77,8 @@ ssize_t write_all(int sock, char **data, size_t *data_sz) {
     size_t sent = 0;
     char *ptr = NULL;
     size_t sz = 0;
+    time_t start = time(NULL);
+    time_t curr = 0;
 
     if(sock < 0 || !data || !data_sz)
         return -1;
@@ -87,6 +91,9 @@ ssize_t write_all(int sock, char **data, size_t *data_sz) {
     }
 
     while(sent < sz) {
+        curr = time(NULL);
+        if((curr - start) >= CONN_TIMEOUT)
+            return -1;
         r = write(sock, ptr, sz - sent);
         if(r < 0)
            return -1;
@@ -101,7 +108,9 @@ ssize_t read_all(int sock, char **data, size_t *data_sz) {
     size_t sent = 0;
     int r = 0;
     char *ptr = NULL;
-
+    time_t start = time(NULL);
+    time_t curr = 0;
+    
     if(sock < 0 || !data || !data_sz)
         return -1;
 
@@ -129,6 +138,9 @@ ssize_t read_all(int sock, char **data, size_t *data_sz) {
         return -1;
 
     while(sent < bytes_available) {
+        curr = time(NULL);
+        if((curr - start) >= CONN_TIMEOUT)
+            return -1;
         r = read(sock, ptr, bytes_available - sent);
         if(r < 0)
             return -1;
