@@ -315,6 +315,9 @@ void collect_dead_clients_worker(void) {
     time_t curr = time(NULL);
     long gap = 0;
     
+    // XXX: disable dead client collector
+    //   to fix bug in which alive connections
+    //   being colledted
     while(1) {}
     
     pthread_mutex_lock(&dead_client_worker);
