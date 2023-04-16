@@ -315,6 +315,8 @@ void collect_dead_clients_worker(void) {
     time_t curr = time(NULL);
     long gap = 0;
     
+    while(1) {}
+    
     pthread_mutex_lock(&dead_client_worker);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
