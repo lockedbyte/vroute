@@ -205,43 +205,6 @@ char *PKCS7_unpad(char *data, size_t data_sz, int block_size, size_t *out_size) 
     return p;
 }
 
-#if 0
-char *PKCS7_unpad(char *data, size_t data_sz, int bs, size_t *out_size, int is_chall) {
-    EVP_CIPHER_CTX *ctx = NULL;
-    int out_len = 0;
-    char *ptr = NULL;
-    
-    if(!data || data_sz == 0 || bs < 0 || !out_size || is_chall < 0)
-        return NULL;
-        
-    *out_size = 0;
-    
-    ptr = calloc(data_sz, sizeof(char));
-    if(!ptr)
-        return NULL;
-
-    ctx = EVP_CIPHER_CTX_new();
-    EVP_CIPHER_CTX_init(ctx);
-
-    if(is_chall)
-        EVP_DecryptInit_ex(ctx, EVP_aes_256_ecb(), NULL, NULL, NULL);
-    else
-        EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, NULL, NULL);
-
-    EVP_DecryptUpdate(ctx, ptr, &out_len, data, data_sz - bs);
-    EVP_DecryptFinal_ex(ctx, ptr + out_len, &out_len);
-
-    if(ctx) {
-        EVP_CIPHER_CTX_free(ctx);
-        ctx = NULL;
-    }
-    
-    *out_size = out_len;
-
-    return ptr;
-}
-#endif
-
 char *encrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t *out_size) {
     char *h_key = NULL;
     size_t h_sz = 0;
