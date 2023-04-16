@@ -1,27 +1,93 @@
 /*
 
-TODO:
-- test
-- add logging
-- finish route discovery
+Repository: https://github.com/lockedbyte/vroute
 
-TO-CHECK:
-- compile with ASAN to detect memory corruption issues
-- look for and fix memory leaks
-- truncation issues with: ssize_t vs int?
-- logic issues with is_https conditional blocks
-- make sure you receive less bytes than you parse / use (oob reads)
+-------------------------------- [ User notes ] --------------------------------
 
-FUTURE:
-- change to new OpenSSL encryption escheme using EVP
+A brief message
+===================
 
-Compilation:
+One of the main features of this project is allowing multiple clients in the
+relay-server side acting as nodes from where to route our connections into
+destinations we are unable to access directly.
 
-$ gcc -o server server.c -lssl -lcrypto -lpthread
+The current approach is request feedback from every node callbacking into the
+relay-server as part of the polling loop, this way checking one by one in all
+of them whether they have access to the destination or not.
 
-...
+This has an extreme performance overhead, especially not because we need to
+iterate over every node, but because we use the HTTP-style of communication,
+so we rely on the client to connect to us first so that we can request such
+destination rechability check.
 
-- make ping worker close HTTP(S) connections whole last connection is more than a specific time defined
+For this reason, I apply a timeout that, once reached, and if no client reported
+a FORWARD_CONNECTION_SUCCCESS command, we consider the destination as unrechable.
+
+This approach would be much faster with raw TCP, but in some environments HTTP(S)
+is a must to bypass firewalls and other defensive solutions.
+
+In conclusion, there is a bottleneck problem related to this connection-opening
+feature, which might turn the server slow if a SOCKS client eventually attempts
+to open a big amount of connections in bulk. This will in turn, make the connection
+opening process slow as it will have to go through every client, until the timeout
+is reached or one of the clients reply with FORWARD_CONNECTION_SUCCESS.
+
+There is though a possible solution to speed up and improve performance which is
+adding more global references representing "connection-opening requests" so that
+multiple connections can be opened simultaneously.
+
+It is advised, if you are using proxychains as your SOCKS proxy client, to change
+in /etc/proxychains.conf these values to the following:
+
+tcp_read_time_out 150000
+tcp_connect_time_out 80000
+
+Also, no need to mention you need to point the SOCKS proxy address and port to the
+one set up with this project.
+
+
+Future additions
+==================
+
+- change encryption to the new OpenSSL encryption escheme using EVP
+- improve performance of route discovery allowing multiple instances simultaneously
+- allow second-order connections for nodes to increase remote accessibility within the network map
+
+
+Compilation
+===================
+
+Simply:
+
+$ make
+
+
+Usage and environment setup
+===============================
+
+Server:
+
+- Use libvroute_server.so on your C2 server
+- Use vroutesrv command line tool
+
+Client:
+
+- Use libvroute_client.so from your implant
+- Use vrouteclt command line tool (not recommended)
+
+
+About HTTPS
+===============
+
+You will need a certificate for setting up the HTTPS version.
+
+If you just want to test, you can simply:
+
+$ openssl req -newkey rsa:2048 -nodes -keyout cert.pem -x509 -days 365 -out cert.pem
+
+And then pass the path to cert.pem to the server initialization entrypoing
+
+------------------------------- [ End User notes ] -------------------------------
 
 */
 
@@ -429,7 +495,7 @@ void ping_worker(void) {
 
 void __ping_worker(void) {
     pthread_t th;
-    pthread_create(&th, NULL, ping_worker, NULL);
+    pthread_create(&th, NULL, (void *)ping_worker, NULL);
     return;
 }
 
@@ -920,8 +986,6 @@ int close_channel(int channel_id, int is_client_req) {
     if(channel_id <= 0)
         return 0;
         
-    puts("AAAAA");
-        
    // pthread_mutex_lock(&client_glb_conn_lock);
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
@@ -933,16 +997,12 @@ int close_channel(int channel_id, int is_client_req) {
             }
         }
     }
-    
-    puts("bbbbbbbb");
    
     if(idx == -1 || c_idx == -1) {
         VR_LOG(LOG_ERROR, "Could not find channel definition with channel ID: %d", channel_id);
       //  pthread_mutex_unlock(&client_glb_conn_lock);
         return 0;
     }
-    
-    puts("cccccccc");
    
     client_conns[c_idx].c_channels[idx].channel_id = 0;
     client_conns[c_idx].c_channels[idx].client_id = 0;
@@ -953,8 +1013,6 @@ int close_channel(int channel_id, int is_client_req) {
         close(client_conns[c_idx].c_channels[idx].proxy_client_sock);
         client_conns[c_idx].c_channels[idx].proxy_client_sock = -1;
     }
-    
-    puts("dddddddd");
    
     if(!is_client_req) {
         if(!send_remote_cmd(CHANNEL_CLOSE_CMD, channel_id)) {
@@ -963,8 +1021,6 @@ int close_channel(int channel_id, int is_client_req) {
             return 0;
         }
     }
-    
-    puts("eeeeee");
   
  //   pthread_mutex_unlock(&client_glb_conn_lock);
     return 1;
@@ -977,8 +1033,6 @@ int channel_exists(int channel_id) {
    
     if(channel_id <= 0)
         return 0;
-        
-    puts("4346634qsd");
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
         for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
@@ -989,14 +1043,10 @@ int channel_exists(int channel_id) {
             }
         }
     }
-    
-    puts("4346634yyyyyyyyyyyyyyyyyyyyyyyyyyyyyqsd");
    
     if(idx == -1 || c_idx == -1) {
         return 0;
     }
-    
-    puts("87dzx3");
    
     return 1;
 }
@@ -1948,17 +1998,13 @@ int __interpret_remote_packet(int client_id, char *data, size_t data_sz) {
                     VR_LOG(LOG_DEBUG, "Received FORWARD_CONNECTION_FAILURE for channel_id: %d", cmd_p->channel_id);
                 }
                 
-                puts("hdethzsdetjh");
-                
                 if(channel_exists(cmd_p->channel_id)) {
                     VR_LOG(LOG_WARN, "Channel ID %d already exists", cmd_p->channel_id);
                     if(!found) {
-                        puts("wwwwvdfndgfn");
                         if(!close_channel(cmd_p->channel_id, 1)) {
                             VR_LOG(LOG_ERROR, "Error trying to close channel ID: %d", cmd_p->channel_id);
                             return 0;
                         }
-                        puts("w666666666666666666666dgfn");
                         return 1;
                     }
                     VR_LOG(LOG_ERROR, "Channel already opened, we are not supposed to receive FORWARD_CONNECTION_SUCCESS messages");
@@ -1968,14 +2014,10 @@ int __interpret_remote_packet(int client_id, char *data, size_t data_sz) {
                 if(!is_route_discovery_in_process())
                     return 1;
                 
-                puts("4y34qwygasr");
-                
                 if(is_client_in_checked_list(cmd_p->channel_id)) {
                     VR_LOG(LOG_INFO, "This client has already been checked: No access to requested destination");
                     return 1;
                 }
-                
-                puts("rrrrrhaehgashgas");
                 
                 if(!mark_route_found(client_id, cmd_p->channel_id, found)) {
                     VR_LOG(LOG_ERROR, "Could not mark route as found");
@@ -2315,12 +2357,8 @@ int relay_tcp_srv_poll(int sock) {
 
     fds[0].fd = sock;
     fds[0].events = POLLIN;
-    
-    puts("srv loopAAAAAAAAAAAAAAAAAAAAAAAon");
   
     while(1) {
-        puts("srv loopon");
-        
         if(tmp_buffer) {
             free(tmp_buffer);
             tmp_buffer = NULL;
@@ -2373,8 +2411,6 @@ int relay_tcp_srv_poll(int sock) {
             continue;
         }
         
-        puts("srv ewgawgloopon");
-        
         res = poll(fds, 1, POLL_TIMEOUT);
         if(res == -1) {
             if(cid) {
@@ -2385,11 +2421,9 @@ int relay_tcp_srv_poll(int sock) {
             err = 1;
             goto end;
         } else if(res == 0) {
-            puts("srv lowwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwopon");
             continue;
         } else {
             if(fds[0].revents & POLLIN) {
-                puts("srv loopon333333333333333333333333333333333333333333333333333333");
                 rx = read_all(sock, &tmp_buffer, &tmp_buffer_sz);
                 if(rx < 0) {
                     if(cid) {
@@ -2423,8 +2457,6 @@ int relay_tcp_srv_poll(int sock) {
                     err = 1;
                     goto end;
                 }
-                
-                puts(",kj,j,,,,,,");
 
             } else if((fds[0].revents & POLLHUP) != 0) { /* conn closed */
                 if(cid) {
@@ -2936,11 +2968,7 @@ int issue_connection_open(int proxy_sock, uint32_t ip_addr, uint16_t port) {
     time_t curr_time = 0;
     struct in_addr i_addr;
     
-    puts("pre iopen lock");
-    
     pthread_mutex_lock(&iopen_lock);
-
-    puts("post iopen lock");
     
     if(conn_req_glb) {
         VR_LOG(LOG_WARN, "conn_req_glb is not NULL and it should be...");
@@ -3105,7 +3133,16 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
     if(req_type == DATA_SENDING_TYPE ||
             req_type == DATA_REQUEST_TYPE) {
         cid = param;
+        
+        if(!client_exists(cid)) {
+            VR_LOG(LOG_ERROR, "HTTP request 'cid' parameter contains an non-existing client ID");
+            err = 1;
+            goto end;
+        }
+        
         if(req_type == DATA_SENDING_TYPE) {
+            VR_LOG(LOG_DEBUG, "Client sending data to the server...");
+            
             enc = get_data_from_http(data, data_sz, &enc_sz);
             if(!enc || enc_sz == 0) {
                 VR_LOG(LOG_ERROR, "Error trying to get data from HTTP request");
@@ -3120,6 +3157,8 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
                 goto end;
             }
 		   
+            VR_LOG(LOG_DEBUG, "Received a total of %ld raw data bytes from client...", raw_sz);
+            
             if(!interpret_remote_packet(cid, raw, raw_sz)) {
                 VR_LOG(LOG_ERROR, "Error trying to interpret remote packet");
                 err = 1;
@@ -3134,6 +3173,8 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
             *out_size = 0;
             return NULL;
         } else if(req_type == DATA_REQUEST_TYPE) {
+            VR_LOG(LOG_DEBUG, "Client is asking for data to be returned...");
+            
             // TODO: should we add more locking here to ensure concurrency issues on multiple clients at once?
             VR_LOG(LOG_DEBUG, "Data requested by client...");
             
@@ -3150,6 +3191,8 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
                 *out_size = 0;
                 return NULL;
             }
+            
+            VR_LOG(LOG_DEBUG, "Returning to client %ld bytes in total...", qsize);
 	    
 	    VR_LOG(LOG_DEBUG, "Encrypting output data...");
 	    
@@ -3186,6 +3229,8 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
             }
         }
     } else if(req_type == HANDSHAKE_SESSION_TYPE) {
+        VR_LOG(LOG_DEBUG, "Client request is handshake-related...");
+        
         h_id = param;
         if(handshake_sess_exists(h_id)) {
             if(is_challenge_solved(h_id) || is_challenge_failure(h_id)) {
@@ -3198,6 +3243,8 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
                         err = 1;
                         goto end;
                     }
+                    
+                    VR_LOG(LOG_INFO, "Created client ID for new relay session: %d", cid);
                 } else if (is_challenge_failure(h_id)) {
                     cid = 0;
                 } else {
@@ -3349,6 +3396,8 @@ int relay_http_srv_handle_req(rl_arg_pass *arg) {
         err = 0;
         goto end;
     }
+    
+    VR_LOG(LOG_DEBUG, "Received %ld bytes from client...", data_sz);
 
     out = interpret_http_req(data, data_sz, &out_size);
     if(!out || out_size == 0) {
@@ -3363,6 +3412,8 @@ int relay_http_srv_handle_req(rl_arg_pass *arg) {
       		     "\r\n%s", "<!DOCTYPE html><html><head><title>blank</title></head><body><h1>blank page</h1></body></html>");
         out_size = strlen(out);
     }
+    
+    VR_LOG(LOG_DEBUG, "Sending %ld bytes to client...", out_size);
    
     r = http_write_all(sock, c_ssl, &out, &out_size, is_https);
     if(r < 0) {
@@ -3370,8 +3421,6 @@ int relay_http_srv_handle_req(rl_arg_pass *arg) {
         err = 1;
         goto end;
     }
-    
-    puts("AAA");
   
     err = 0;
 end:
@@ -3742,7 +3791,7 @@ void start_proxy_srv(arg_pass *arg) {
         continue;
     }
      
-    if(pthread_create(&tid[z], NULL, proxy_srv_poll, ((void *)connfd))) {
+    if(pthread_create(&tid[z], NULL, (void *)proxy_srv_poll, ((void *)connfd))) {
         VR_LOG(LOG_ERROR, "Error creating thread");
         continue;
     }
@@ -3946,7 +3995,7 @@ int do_http_relay_srv(char *host, int port) {
 
         c_ssl = NULL;
      
-        if(pthread_create(&tid[z], NULL, relay_http_srv_handle_req, ((void *)a_pass))) {
+        if(pthread_create(&tid[z], NULL, (void *)relay_http_srv_handle_req, ((void *)a_pass))) {
             VR_LOG(LOG_ERROR, "Error creating thread");
             continue;
         }
@@ -4078,7 +4127,7 @@ int do_tcp_relay_srv(char *host, int port) {
             continue;
         }
 
-        if(pthread_create(&tid[z], NULL, relay_tcp_srv_poll, ((void *)connfd))) {
+        if(pthread_create(&tid[z], NULL, (void *)relay_tcp_srv_poll, ((void *)connfd))) {
             VR_LOG(LOG_ERROR, "Error creating thread");
             continue;
         }
@@ -4186,7 +4235,7 @@ int __start_proxy_srv(char *proxy_host, int proxy_port) {
     arg->port = proxy_port;
     arg->proto = TCP_COM_PROTO;
      
-    if(pthread_create(&th, NULL, start_proxy_srv, (void *)arg)) {
+    if(pthread_create(&th, NULL, (void *)start_proxy_srv, (void *)arg)) {
         VR_LOG(LOG_ERROR, "Error creating thread");
         return 0;
     }
@@ -4209,7 +4258,7 @@ int __start_relay_srv(char *relay_host, int relay_port, proto_t proto) {
     arg->port = relay_port;
     arg->proto = proto;
      
-    if(pthread_create(&th, NULL, start_relay_srv, (void *)arg)) {
+    if(pthread_create(&th, NULL, (void *)start_relay_srv, (void *)arg)) {
         VR_LOG(LOG_ERROR, "Error creating thread");
         return 0;
     }
@@ -4480,7 +4529,7 @@ int main(void) {
     int err = 0;
     // note: NULL is allowed for &err arg
     // generate error codes and a translate-to-error-string table on socks4_rev_strerror() to get error information
-    if(!start_socks4_rev_proxy("127.0.0.1", 1080, "127.0.0.1", 1337, HTTP_COM_PROTO, PSK, strlen(PSK), "./cert.pem", &err)) {
+    if(!start_socks4_rev_proxy("127.0.0.1", 1080, "127.0.0.1", 1337, HTTPS_COM_PROTO, PSK, strlen(PSK), "./cert.pem", &err)) {
         VR_LOG(LOG_ERROR, "Error.: Server failed. (%d): %s\n", err, socks4_rev_strerror(err));
         return 1;
     }

@@ -1,24 +1,93 @@
 /*
 
-...
+Repository: https://github.com/lockedbyte/vroute
 
-TODO:
-- test
-- add logging
+-------------------------------- [ User notes ] --------------------------------
 
-TO-CHECK:
-- compile with ASAN to detect memory corruption issues
-- look for and fix memory leaks
-- truncation issues with: ssize_t vs int?
-- logic issues with is_https conditional blocks
-- make sure you receive less bytes than you parse / use (oob reads)
+A brief message
+===================
 
-FUTURE:
-- change to new OpenSSL encryption escheme using EVP
+One of the main features of this project is allowing multiple clients in the
+relay-server side acting as nodes from where to route our connections into
+destinations we are unable to access directly.
 
-Compilation:
+The current approach is request feedback from every node callbacking into the
+relay-server as part of the polling loop, this way checking one by one in all
+of them whether they have access to the destination or not.
 
-$ gcc -o client client.c -lssl -lcrypto -lpthread
+This has an extreme performance overhead, especially not because we need to
+iterate over every node, but because we use the HTTP-style of communication,
+so we rely on the client to connect to us first so that we can request such
+destination rechability check.
+
+For this reason, I apply a timeout that, once reached, and if no client reported
+a FORWARD_CONNECTION_SUCCCESS command, we consider the destination as unrechable.
+
+This approach would be much faster with raw TCP, but in some environments HTTP(S)
+is a must to bypass firewalls and other defensive solutions.
+
+In conclusion, there is a bottleneck problem related to this connection-opening
+feature, which might turn the server slow if a SOCKS client eventually attempts
+to open a big amount of connections in bulk. This will in turn, make the connection
+opening process slow as it will have to go through every client, until the timeout
+is reached or one of the clients reply with FORWARD_CONNECTION_SUCCESS.
+
+There is though a possible solution to speed up and improve performance which is
+adding more global references representing "connection-opening requests" so that
+multiple connections can be opened simultaneously.
+
+It is advised, if you are using proxychains as your SOCKS proxy client, to change
+in /etc/proxychains.conf these values to the following:
+
+tcp_read_time_out 150000
+tcp_connect_time_out 80000
+
+Also, no need to mention you need to point the SOCKS proxy address and port to the
+one set up with this project.
+
+
+Future additions
+==================
+
+- change encryption to the new OpenSSL encryption escheme using EVP
+- improve performance of route discovery allowing multiple instances simultaneously
+- allow second-order connections for nodes to increase remote accessibility within the network map
+
+
+Compilation
+===================
+
+Simply:
+
+$ make
+
+
+Usage and environment setup
+===============================
+
+Server:
+
+- Use libvroute_server.so on your C2 server
+- Use vroutesrv command line tool
+
+Client:
+
+- Use libvroute_client.so from your implant
+- Use vrouteclt command line tool (not recommended)
+
+
+About HTTPS
+===============
+
+You will need a certificate for setting up the HTTPS version.
+
+If you just want to test, you can simply:
+
+$ openssl req -newkey rsa:2048 -nodes -keyout cert.pem -x509 -days 365 -out cert.pem
+
+And then pass the path to cert.pem to the server initialization entrypoing
+
+------------------------------- [ End User notes ] -------------------------------
 
 */
 
@@ -38,7 +107,7 @@ $ gcc -o client client.c -lssl -lcrypto -lpthread
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <ctype.h>
-#include <stdarg.h>
+#include <errno.h>
 
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
@@ -221,6 +290,8 @@ channel_def *global_conn = NULL;
 
 int pending_ch_array[MAX_CONCURRENT_CHANNELS] = { 0 };
 
+int cert_shown = 0;
+
 #if DEBUG
 
 void vr_log(const char *func_name, log_level_t log_level, const char *format_str, ...) {
@@ -283,7 +354,7 @@ void ping_worker(void) {
 
 void __ping_worker(void) {
     pthread_t th;
-    pthread_create(&th, NULL, ping_worker, NULL);
+    pthread_create(&th, NULL, (void *)ping_worker, NULL);
     return;
 }
 
@@ -324,15 +395,11 @@ ssize_t http_write_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int i
     char *ptr = NULL;
     size_t sz = 0;
 
-    if(sock < 0 || !data || !data_sz) {
-        puts("w");
+    if(sock < 0 || !data || !data_sz)
         return -1;
-    }
         
-    if(is_https && !c_ssl) {
-        puts("l");
+    if(is_https && !c_ssl)
         return -1;
-    }
 
     if(data && data_sz) {
         ptr = *data;
@@ -544,20 +611,24 @@ int open_http_conn(char *host, int port, int is_https, SSL **c_ssl) {
         cert_name = X509_get_subject_name(cert);
         issuer_name = X509_get_issuer_name(cert);
         
-        name = X509_NAME_oneline(cert_name, 0, 0);
-        VR_LOG(LOG_INFO, "Cert subject: %s", name);
+        if(!cert_shown) { 
+            name = X509_NAME_oneline(cert_name, 0, 0);
+            VR_LOG(LOG_INFO, "Cert subject: %s", name);
         
-        if(name) {
-            free(name);
-            name = NULL;
-        }
+            if(name) {
+                free(name);
+                name = NULL;
+            }
         
-        name = X509_NAME_oneline(issuer_name, 0, 0);
-        VR_LOG(LOG_INFO, "Cert Issuer: %s", name);
+            name = X509_NAME_oneline(issuer_name, 0, 0);
+            VR_LOG(LOG_INFO, "Cert Issuer: %s", name);
 
-        if(name) {
-            free(name);
-            name = NULL;
+            if(name) {
+                free(name);
+                name = NULL;
+            }
+            
+            cert_shown = 1;
         }
         
         _ssl = ssl;
@@ -1109,8 +1180,6 @@ int open_channel_conn(int channel_id, char *host, int port) {
         close(sock);
         return 0;
     }
-    
-    puts("kawgjgi");
 
     //pthread_mutex_lock(&glb_conn_lock);
 
@@ -1120,8 +1189,6 @@ int open_channel_conn(int channel_id, char *host, int port) {
             close_channel(channel_id);
         }
     }
-    
-    puts("erahaerhaerhae");
         
     for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS ; x++) {
         if(pending_ch_array[x] == 0) {
@@ -1479,8 +1546,6 @@ uint32_t do_tcp_handshake(int sock, char *key, size_t key_sz) {
         return 0;
     }
         
-    puts("tcpphandshake2222");
-        
     if(r != CHALLENGE_DEFAULT_SIZE) {
         VR_LOG(LOG_ERROR, "Received number of bytes is not CHALLENGE_DEFAULT_SIZE");
         return 0;
@@ -1647,7 +1712,7 @@ uint32_t handshake(int sock, char *host, int port, proto_t proto, char *key, siz
         return 0;
     }
     
-    VR_LOG(LOG_INFO, "Challenge succeed in authentication by client...");
+    VR_LOG(LOG_INFO, "Challenge succeed in authentication by client. Client ID: %d", cid);
 
     client_id = cid;
     handshake_sess_id = 0;
@@ -1736,8 +1801,6 @@ void relay_poll(char *host, int port, proto_t proto) {
 
         tv.tv_sec = 1;
         tv.tv_usec = 0;
-        
-        puts("xxxx");
 
         retval = select(FD_SETSIZE, &rfds, &ofds, NULL, &tv);
         if(retval == -1) {
@@ -1750,8 +1813,6 @@ void relay_poll(char *host, int port, proto_t proto) {
             //pthread_mutex_unlock(&glb_conn_lock);
             //continue;
         }
-        
-        puts("mmmmm");
 
         for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS ; x++) {
             if(pending_ch_array[x] > 0) {
@@ -1831,8 +1892,6 @@ void relay_poll(char *host, int port, proto_t proto) {
         sleep(2);
         continue;
     }
-    
-    puts("lkllllllllllllllll");
 
     for(int i = 0 ; i < MAX_CONCURRENT_CHANNELS ; i++) {
         if(global_conn[i].channel_id != 0 && global_conn[i].sock > 0) {
@@ -1907,8 +1966,6 @@ void relay_poll(char *host, int port, proto_t proto) {
             }
         }
     }
-    
-    puts("tttttttttttttttttt");
 
     // We check here if there is something to receive from control server
     // If 0 bytes received, means nothing was sent by the server, so
@@ -2205,7 +2262,7 @@ int start_relay_conn(char *host, int port, proto_t proto, char *key, size_t key_
 #define PSK "p@ssw0rd_3241!!=#"
 
 int main(void) {
-    if(!start_relay_conn("127.0.0.1", 1337, HTTP_COM_PROTO, PSK, strlen(PSK))) {
+    if(!start_relay_conn("127.0.0.1", 1337, HTTPS_COM_PROTO, PSK, strlen(PSK))) {
         VR_LOG(LOG_ERROR, "Unknown error occurred");
         return 1;
     }

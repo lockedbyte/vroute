@@ -8,6 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <time.h>
 
 #include "util.h"
 
@@ -82,8 +83,6 @@ ssize_t write_all(int sock, char **data, size_t *data_sz) {
 
     if(sock < 0 || !data || !data_sz)
         return -1;
-        
-    printf("writing %d bytes on sock\n", *data_sz);
 
     if(data && data_sz) {
         ptr = *data;
@@ -124,8 +123,6 @@ ssize_t read_all(int sock, char **data, size_t *data_sz) {
     #endif
     if(r < 0)
         return -1;
-        
-    printf("there are %d bytes available\n", bytes_available);
 
     if(bytes_available < 0) {
         *data = NULL;
