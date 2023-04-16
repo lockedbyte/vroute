@@ -666,7 +666,7 @@ ssize_t send_http_data(char *host, int port, char **data, size_t *data_size, int
     asprintf(&port_str, ":%d", port);
   
     if(handshake_sess_id != 0 && client_id == 0) {
-        asprintf(&http_req, "GET %s?h=%ld HTTP/1.1\r\n"
+        asprintf(&http_req, "POST %s?h=%ld HTTP/1.1\r\n"
                   "Host: %s%s\r\n"
                   "User-Agent: %s\r\n"
                   "Accept: */*\r\n"
@@ -674,7 +674,7 @@ ssize_t send_http_data(char *host, int port, char **data, size_t *data_size, int
                   "\r\ntoken=%s; expire=0;", DEFAULT_HTTP_PATH, handshake_sess_id, host, (port == 80) ? "" : port_str,
                             DEFAULT_HTTP_USER_AGENT, strlen(http_str) + 11, http_str);
     } else {
-        asprintf(&http_req, "GET %s?cid=%d HTTP/1.1\r\n"
+        asprintf(&http_req, "POST %s?cid=%d HTTP/1.1\r\n"
                   "Host: %s%s\r\n"
                   "User-Agent: %s\r\n"
                   "Accept: */*\r\n"
