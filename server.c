@@ -108,6 +108,7 @@ And then pass the path to cert.pem to the server initialization entrypoing
 #include <sys/ioctl.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <signal.h>
 
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
@@ -124,7 +125,7 @@ And then pass the path to cert.pem to the server initialization entrypoing
 #include "crypt.h"
 #include "tp/base64.h"
 
-#define DEBUG 1
+#include "server.h"
 
 #define VROUTE_VERSION "1.0.0"
 
@@ -135,11 +136,6 @@ And then pass the path to cert.pem to the server initialization entrypoing
 #define POLL_TIMEOUT 2000
 
 #define IN_ANY_ADDR "0.0.0.0"
-
-#define MAX_CONCURRENT_PROXY_CLIENTS 1024
-#define MAX_CONCURRENT_CLIENTS 1024
-#define MAX_CONCURRENT_CHANNELS_PER_CLIENT 2048
-#define MAX_CONCURRENT_QUEUED_BUFFERS MAX_CONCURRENT_CLIENTS * 256
 
 #define MAX_HOSTNAME_SIZE 255
 
@@ -243,144 +239,6 @@ connected to the application server.
 
 #define LAST_CONN_GAP_THRESHOLD 60 * 5 // 5 minutes
 
-typedef enum {
-    HTTPS_COM_PROTO = 0,
-    HTTP_COM_PROTO = 1,
-    TCP_COM_PROTO = 2
-} proto_t;
-
-typedef enum {
-    UNKNOWN_REQUEST_TYPE = 0,
-    HANDSHAKE_SESSION_TYPE,
-    DATA_REQUEST_TYPE,
-    DATA_SENDING_TYPE,
-} req_t;
-
-typedef struct _channel_def {
-    int channel_id;
-    int client_id;
-    int32_t dst_ip_addr;
-    int16_t dst_port;
-    int proxy_client_sock;
-} channel_def;
-
-typedef struct _conn_def {
-    int client_id;
-    int sock;
-    proto_t proto;
-    time_t last_conn_timestamp;
-    int32_t client_ip_addr;
-    int16_t orig_port;
-    channel_def *c_channels;
-} conn_def;
-
-typedef struct buffer_queue buffer_queue;
-
-typedef struct buffer_queue {
-    int queue_id;
-    int client_id;
-    size_t size;
-    time_t queue_time;
-    buffer_queue *next;
-    char data[0];
-};
-
-typedef struct _proxy_client_def {
-    int proxy_client_id;
-    int sock;
-    int channel_id;
-    int32_t client_ip_addr;
-    int16_t orig_port;
-} proxy_client_def;
-
-typedef struct _http_handshake_def {
-    int h_id;
-    char *challenge;
-    char *solution;
-    int is_solved;
-    int fail;
-    size_t sol_size;
-} http_handshake_def;
-
-typedef struct __attribute__((packed)) _socks_hdr {
-    uint8_t vn;
-    uint8_t cd;
-    uint16_t dstport;
-    uint32_t dstip;
-    uint8_t null_c;
-} socks_hdr;
-
-typedef struct __attribute__((packed)) _tlv_header {
-    uint16_t client_id;
-    uint16_t channel_id;
-    uint16_t tlv_data_len;
-} tlv_header;
-
-typedef struct __attribute__((packed)) _s_cmd {
-    uint8_t cmd;
-    uint16_t channel_id;
-} s_cmd;
-
-typedef struct __attribute__((packed)) _conn_cmd {
-    uint8_t cmd;
-    uint16_t channel_id;
-    uint32_t ip_addr;
-    uint16_t port;
-} conn_cmd;
-
-typedef enum {
-    UNKNOWN_CMD = 0,
-    CHANNEL_OPEN_CMD,
-    CHANNEL_CLOSE_CMD,
-    RELAY_CLOSE_CMD,
-    PING_CMD,
-    FORWARD_CONNECTION_SUCCESS,
-    FORWARD_CONNECTION_FAILURE,
-    CMD_DATA_LAST_NULL_ENTRY
-} scmd_t;
-
-typedef enum {
-    SERVER_UNKNOWN_ERR = 1,
-    INVALID_PARAMETER = 2,
-    OUT_OF_MEMORY_ERROR = 3,
-    // ...
-} srv_error_t;
-
-typedef struct _arg_pass {
-    char *host;
-    int port;
-    proto_t proto;
-} arg_pass;
-
-typedef struct _rl_arg_pass {
-    int sock;
-    SSL *c_ssl;
-    int is_https;
-} rl_arg_pass;
-
-typedef struct _cmd_def {
-    int cmd;
-    unsigned char value;
-    char *name;
-} cmd_def;
-
-typedef struct _conn_open_req {
-    int is_routed;
-    int channel_id;
-    int client_id;
-    uint32_t ip;
-    uint16_t port;
-    int client_id_arr[MAX_CONCURRENT_CLIENTS];
-} conn_open_req;
-
-typedef enum {
-    UNKNOWN_LOG_LEVEL = 0,
-    LOG_WARN,
-    LOG_INFO,
-    LOG_DEBUG,
-    LOG_ERROR,
-} log_level_t;
-
 cmd_def cmd_def_data[] = {
     [UNKNOWN_CMD] = {
         .cmd = UNKNOWN_CMD,
@@ -483,13 +341,13 @@ void ping_worker(void) {
         sleep(10);
         curr_time = time(NULL);
         if(close_srv) {
-            pthread_exit(1);
+            pthread_exit(NULL);
             return;
         }
 
         collect_dead_clients_worker();
     }
-    pthread_exit(0);
+    pthread_exit(NULL);
     return;
 }
 
@@ -755,7 +613,7 @@ int create_handshake(int h_id) {
         }
         VR_LOG(LOG_ERROR, "Error hashing solution in SHA-256");
         pthread_mutex_unlock(&handshake_glb_conn_lock);
-        return NULL;
+        return 0;
     }
 
     if(sol_a) {
@@ -877,6 +735,32 @@ char *get_h_challenge_solution(int h_id, size_t *out_size) {
     return sol;
 }
 
+/* XXX: locking relies on caller */
+int channel_exists(int channel_id) {
+    int idx = -1;
+    int c_idx = -1;
+   
+    if(channel_id <= 0)
+        return 0;
+
+    for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+        for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
+            if(client_conns[i].c_channels && client_conns[i].c_channels[x].channel_id == channel_id) {
+                c_idx = i;
+                idx = x;
+                break;
+            }
+        }
+    }
+   
+    if(idx == -1 || c_idx == -1) {
+        return 0;
+    }
+   
+    return 1;
+}
+
+
 int create_channel(int client_id, int proxy_sock, char *host, int port) {
     int c_idx = -1;
     int idx = -1;
@@ -979,6 +863,96 @@ int create_channel_custom(int channel_id, int client_id, int proxy_sock, char *h
     return channel_id;
 }
 
+int send_remote_cmd(scmd_t cmd, int channel_id) {
+    char *p = NULL;
+    size_t p_sz = 0;
+    tlv_header *tlv = NULL;
+    s_cmd *cmd_p = NULL;
+    int client_id = 0;
+    int rsock = 0;
+    ssize_t rx = 0;
+    char *enc = NULL;
+    size_t enc_sz = 0;
+  
+    if(channel_id <= 0)
+        return 0;
+    
+    switch(cmd) {
+        case CHANNEL_CLOSE_CMD:
+        case RELAY_CLOSE_CMD:
+        case PING_CMD:
+            break;
+        case CHANNEL_OPEN_CMD:			/* issued independently */
+        case FORWARD_CONNECTION_SUCCESS:	/* server-only command */
+        case FORWARD_CONNECTION_FAILURE:	/* server-only command */
+        case UNKNOWN_CMD:			/* unknown command */
+        default:
+            return 0;
+    }
+  
+    p_sz = sizeof(tlv_header) + sizeof(s_cmd);
+    p = calloc(p_sz, sizeof(char));
+    if(!p)
+        return 0;
+    tlv = (tlv_header *)p;
+    cmd_p = ((s_cmd *)(p + sizeof(tlv_header)));
+
+    client_id = get_client_by_channel_id(channel_id);
+    if(client_id <= 0) {
+        VR_LOG(LOG_ERROR, "Error getting client ID by channel ID: %d", channel_id);
+        return 0;
+    }
+  
+    tlv->client_id = client_id;
+    tlv->channel_id = COMMAND_CHANNEL;
+    tlv->tlv_data_len = sizeof(s_cmd);
+  
+    cmd_p->cmd = cmd_def_data[cmd].value;
+    cmd_p->channel_id = channel_id;
+    
+    VR_LOG(LOG_INFO, "Sending command '%s'", cmd_def_data[cmd].name);
+  
+    if(_proto == TCP_COM_PROTO) {
+        rsock = get_relay_sock_by_client_id(client_id);
+        if(rsock < 0) {
+            VR_LOG(LOG_ERROR, "Error getting relay sock by client ID: %d", client_id);
+            return 0;
+        }
+        
+        enc = encrypt_data(p, p_sz, _key, _key_sz, &enc_sz);
+        if(!enc) {
+            VR_LOG(LOG_ERROR, "Error trying to encrypt data");
+            return 0;
+        }
+
+        rx = write_all(rsock, &enc, &enc_sz);
+        if(rx < 0) {
+            VR_LOG(LOG_ERROR, "Error writing to TCP relay clients");
+            return 0;
+        }
+        
+        if(enc) {
+            free(enc);
+            enc = NULL;
+        }
+    } else if(_proto == HTTP_COM_PROTO || 
+                _proto == HTTPS_COM_PROTO) {
+        if(!queue_data(client_id, p, p_sz, time(NULL))) {
+            VR_LOG(LOG_ERROR, "Error trying to queue data");
+            return 0;
+        }
+    }
+    
+    // XXX: fix p memory leaks on this function
+    
+    if(p) {
+        free(p);
+        p = NULL;  
+    }
+
+    return 1;
+}
+
 int close_channel(int channel_id, int is_client_req) {
     int idx = -1;
     int c_idx = -1;
@@ -1023,31 +997,6 @@ int close_channel(int channel_id, int is_client_req) {
     }
   
  //   pthread_mutex_unlock(&client_glb_conn_lock);
-    return 1;
-}
-
-/* XXX: locking relies on caller */
-int channel_exists(int channel_id) {
-    int idx = -1;
-    int c_idx = -1;
-   
-    if(channel_id <= 0)
-        return 0;
-
-    for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
-        for(int x = 0 ; x < MAX_CONCURRENT_CHANNELS_PER_CLIENT ; x++) {
-            if(client_conns[i].c_channels && client_conns[i].c_channels[x].channel_id == channel_id) {
-                c_idx = i;
-                idx = x;
-                break;
-            }
-        }
-    }
-   
-    if(idx == -1 || c_idx == -1) {
-        return 0;
-    }
-   
     return 1;
 }
 
@@ -1806,96 +1755,6 @@ int parse_socks_hdr(char *data, size_t data_sz, char **host, int *port) {
 
     return 1;
 }
-  
-int send_remote_cmd(scmd_t cmd, int channel_id) {
-    char *p = NULL;
-    size_t p_sz = 0;
-    tlv_header *tlv = NULL;
-    s_cmd *cmd_p = NULL;
-    int client_id = 0;
-    int rsock = 0;
-    ssize_t rx = 0;
-    char *enc = NULL;
-    size_t enc_sz = 0;
-  
-    if(channel_id <= 0)
-        return 0;
-    
-    switch(cmd) {
-        case CHANNEL_CLOSE_CMD:
-        case RELAY_CLOSE_CMD:
-        case PING_CMD:
-            break;
-        case CHANNEL_OPEN_CMD:			/* issued independently */
-        case FORWARD_CONNECTION_SUCCESS:	/* server-only command */
-        case FORWARD_CONNECTION_FAILURE:	/* server-only command */
-        case UNKNOWN_CMD:			/* unknown command */
-        default:
-            return 0;
-    }
-  
-    p_sz = sizeof(tlv_header) + sizeof(s_cmd);
-    p = calloc(p_sz, sizeof(char));
-    if(!p)
-        return 0;
-    tlv = (tlv_header *)p;
-    cmd_p = ((s_cmd *)(p + sizeof(tlv_header)));
-
-    client_id = get_client_by_channel_id(channel_id);
-    if(client_id <= 0) {
-        VR_LOG(LOG_ERROR, "Error getting client ID by channel ID: %d", channel_id);
-        return 0;
-    }
-  
-    tlv->client_id = client_id;
-    tlv->channel_id = COMMAND_CHANNEL;
-    tlv->tlv_data_len = sizeof(s_cmd);
-  
-    cmd_p->cmd = cmd_def_data[cmd].value;
-    cmd_p->channel_id = channel_id;
-    
-    VR_LOG(LOG_INFO, "Sending command '%s'", cmd_def_data[cmd].name);
-  
-    if(_proto == TCP_COM_PROTO) {
-        rsock = get_relay_sock_by_client_id(client_id);
-        if(rsock < 0) {
-            VR_LOG(LOG_ERROR, "Error getting relay sock by client ID: %d", client_id);
-            return 0;
-        }
-        
-        enc = encrypt_data(p, p_sz, _key, _key_sz, &enc_sz);
-        if(!enc) {
-            VR_LOG(LOG_ERROR, "Error trying to encrypt data");
-            return 0;
-        }
-
-        rx = write_all(rsock, &enc, &enc_sz);
-        if(rx < 0) {
-            VR_LOG(LOG_ERROR, "Error writing to TCP relay clients");
-            return 0;
-        }
-        
-        if(enc) {
-            free(enc);
-            enc = NULL;
-        }
-    } else if(_proto == HTTP_COM_PROTO || 
-                _proto == HTTPS_COM_PROTO) {
-        if(!queue_data(client_id, p, p_sz, time(NULL))) {
-            VR_LOG(LOG_ERROR, "Error trying to queue data");
-            return 0;
-        }
-    }
-    
-    // XXX: fix p memory leaks on this function
-    
-    if(p) {
-        free(p);
-        p = NULL;  
-    }
-
-    return 1;
-}
 
 int __interpret_remote_packet(int client_id, char *data, size_t data_sz) {
     int channel_id = 0;
@@ -1907,7 +1766,6 @@ int __interpret_remote_packet(int client_id, char *data, size_t data_sz) {
     char *data_x = NULL;
     size_t data_sz_x = 0;
     s_cmd *cmd_p = NULL;
-    conn_cmd *cmp_p_x = NULL;
     uint8_t cmd = 0;
     int found = 0;
     int cmd_c = 0;
@@ -2330,10 +2188,9 @@ end:
 
 int relay_tcp_srv_poll(int sock) {
     int err = 0;
-    int r = 0;
     int cid = 0;
     int res = 0;
-    struct pollfd fds[1] = { -1 };
+    struct pollfd fds[1];
     char *tmp_buffer = NULL;
     size_t tmp_buffer_sz = 0;
     ssize_t rx = 0;
@@ -2548,8 +2405,6 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
     int r = 0;
     int rx = 0;
     char *ptr = NULL;
-    BIO *s_rbio = NULL;
-    int s_fd = -1;
     int sock_m = -1;
 
     if(sock < 0 || !data || !data_sz)
@@ -2746,7 +2601,7 @@ char *get_data_from_http(char *data, size_t data_sz, size_t *out_size) {
     if(p2[strlen(p2) - 1] == 0x0a)
         p2[strlen(p2) - 1] = '\0';
  
-    raw = base64_decode(p2, strlen(p2), &raw_sz);
+    raw = (char *)base64_decode((unsigned char *)p2, strlen(p2), &raw_sz);
     if(!raw) {
         if(p) {
             free(p);
@@ -2777,7 +2632,7 @@ char *get_http_data_response(char *data, size_t data_sz, size_t *out_size) {
     
     *out_size = 0;
   
-    b64_p = base64_encode(data, data_sz, &b64_sz);
+    b64_p = (char *)base64_encode((unsigned char *)data, data_sz, &b64_sz);
     if(!b64_p || b64_sz == 0) {
         VR_LOG(LOG_ERROR, "Error trying to do base64 encoding");
         *out_size = 0;
@@ -3253,7 +3108,7 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
                     goto end;
                 }
         
-                out = get_http_data_response(&cid, sizeof(uint32_t), &osz);
+                out = get_http_data_response((char *)&cid, sizeof(uint32_t), &osz);
                 if(!out || osz == 0) {
                     VR_LOG(LOG_ERROR, "Error when trying to craft a valid HTTP response (2)");
                     err = 1;
@@ -3457,12 +3312,10 @@ void proxy_srv_poll(int sock) {
     int err = 0;
     char *rhost = NULL;
     int rport = 0;
-    char *data = NULL;
-    size_t data_sz = 0;
     int r = 0;
     int res = 0;
     char socks_hdr_buf[sizeof(socks_hdr) + 1] = { 0 };
-    struct pollfd fds[1] = { -1 };
+    struct pollfd fds[1];
     int client_id = 0;
     int channel_id = 0;
     char *p = NULL;
@@ -3689,19 +3542,15 @@ end:
 void start_proxy_srv(arg_pass *arg) {
     char *proxy_host = NULL;
     int proxy_port = 0;
-    struct sockaddr_in servaddr, cli;
+    struct sockaddr_in servaddr;
     int sfd = 0;
     int err = 0;
     int res = 0;
     int i = 0;
     int connfd = 0;
     int z = 0;
-    int idx = 0;
-    size_t addr_len = 0;
-    int port = 0;
     int addrlen = 0;
     pthread_t tid[MAX_CONCURRENT_PROXY_CLIENTS] = { 0 };
-    char ip[INET_ADDRSTRLEN] = { 0 };
   
     if(!arg) {
         err = 1;
@@ -3791,7 +3640,7 @@ void start_proxy_srv(arg_pass *arg) {
         continue;
     }
      
-    if(pthread_create(&tid[z], NULL, (void *)proxy_srv_poll, ((void *)connfd))) {
+    if(pthread_create(&tid[z], NULL, (void *)proxy_srv_poll, ((void *)(uint64_t)connfd))) {
         VR_LOG(LOG_ERROR, "Error creating thread");
         continue;
     }
@@ -3849,14 +3698,13 @@ void ssl_cleanup(void) {
 }
 
 int do_http_relay_srv(char *host, int port) {
-    struct sockaddr_in servaddr, cli;
+    struct sockaddr_in servaddr;
     int sfd = 0;
     int err = 0;
     int res = 0;
     int i = 0;
     int connfd = 0;
     int z = 0;
-    int idx = 0;
     int addrlen = 0;
     pthread_t tid[MAX_CONCURRENT_CLIENTS] = { 0 };
     rl_arg_pass *a_pass = NULL;
@@ -4036,14 +3884,13 @@ end:
 }
 
 int do_tcp_relay_srv(char *host, int port) {
-    struct sockaddr_in servaddr, cli;
+    struct sockaddr_in servaddr;
     int sfd = 0;
     int err = 0;
     int res = 0;
     int i = 0;
     int connfd = 0;
     int z = 0;
-    int idx = 0;
     int addrlen = 0;
     pthread_t tid[MAX_CONCURRENT_CLIENTS] = { 0 };
   
@@ -4127,7 +3974,7 @@ int do_tcp_relay_srv(char *host, int port) {
             continue;
         }
 
-        if(pthread_create(&tid[z], NULL, (void *)relay_tcp_srv_poll, ((void *)connfd))) {
+        if(pthread_create(&tid[z], NULL, (void *)relay_tcp_srv_poll, ((void *)(uint64_t)connfd))) {
             VR_LOG(LOG_ERROR, "Error creating thread");
             continue;
         }
@@ -4342,7 +4189,7 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
         goto end;
     }
   
-    if(proto == HTTPS_COM_PROTO && !cert_file || strlen(cert_file) == 0) {
+    if(proto == HTTPS_COM_PROTO && (!cert_file || strlen(cert_file) == 0)) {
         VR_LOG(LOG_ERROR, "HTTPS protocol requested, yet cert path not provided");
         fail = INVALID_PARAMETER;
         goto end;
@@ -4432,7 +4279,9 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
     _key = memdup(key, key_sz);
     _key_sz = key_sz;
     _proto = proto;
-    _cert_file = strdup(cert_file);
+    
+    if(cert_file)
+       _cert_file = strdup(cert_file);
     
     VR_LOG(LOG_INFO, "Starting SOCKS proxy server at: %s:%d...", IN_ANY_ADDR, proxy_port);
   
@@ -4525,17 +4374,115 @@ char *socks4_rev_strerror(int err) {
 
 #define PSK "p@ssw0rd_3241!!=#"
 
-int main(void) {
+#if !COMPILE_AS_LIBRARY
+
+void usage(void) {
+    printf("==== { VROUTE SERVER: USAGE } ===\n");
+    printf("\n[0] => HTTPS protocol\n[1] => HTTP protocol\n[2] => Raw TCP protocol\n\n");
+    printf("./vroutesrv <proxy ip> <proxy port> <relay ip> <relay port> <protocol> <password> <cert path (if https)>\n\n");
+    printf("  Eg.: ./vroutesrv 0.0.0.0 1080 0.0.0.0 1337 1 p@ssw0rd1234#\n\n");
+    return;
+}
+
+int main(int argc, char *argv[]) {
+    char *relay_host = NULL;
+    char *proxy_host = NULL;
+    int relay_port = 0;
+    int proxy_port = 0;
+    int proto_n = 0;
+    char *password = NULL;
+    char *cert_path = NULL;
+    proto_t protocol = 0;
     int err = 0;
-    // note: NULL is allowed for &err arg
-    // generate error codes and a translate-to-error-string table on socks4_rev_strerror() to get error information
-    if(!start_socks4_rev_proxy("127.0.0.1", 1080, "127.0.0.1", 1337, HTTPS_COM_PROTO, PSK, strlen(PSK), "./cert.pem", &err)) {
+    
+    if(argc != 7) {
+        usage();
+        return 0;
+    }
+    
+    proto_n = atoi(argv[5]);
+    
+    if(proto_n == 0) {
+        protocol = HTTPS_COM_PROTO;
+    } else if(proto_n == 1) {
+        protocol = HTTP_COM_PROTO;
+    } else if(proto_n == 2) {
+        protocol = TCP_COM_PROTO;
+    } else {
+        usage();
+        return 0;
+    }
+    
+    if(protocol == HTTPS_COM_PROTO && argc != 8) {
+        usage();
+        return 0;
+    }
+    
+    proxy_host = strdup(argv[1]);
+    proxy_port = atoi(argv[2]);
+    relay_host = strdup(argv[3]);
+    relay_port = atoi(argv[4]);
+
+    password = strdup(argv[6]);
+    
+    if(protocol == HTTPS_COM_PROTO)
+        cert_path = strdup(argv[7]);
+        
+    if(!password) {
+        usage();
+        return 0;
+    }
+    
+    if(!start_socks4_rev_proxy(proxy_host, proxy_port, relay_host, relay_port, protocol, password, strlen(password), cert_path, &err)) {
         VR_LOG(LOG_ERROR, "Error.: Server failed. (%d): %s\n", err, socks4_rev_strerror(err));
+        
+        if(relay_host) {
+            free(relay_host);
+            relay_host = NULL;
+        }
+        
+        if(proxy_host) {
+            free(proxy_host);
+            proxy_host = NULL;
+        }
+        
+        if(cert_path) {
+            free(cert_path);
+            cert_path = NULL;
+        }
+        
+        if(password) {
+            free(password);
+            password = NULL;
+        }
+        
         return 1;
     }
+
+    if(relay_host) {
+        free(relay_host);
+        relay_host = NULL;
+    }
+    
+    if(cert_path) {
+        free(cert_path);
+        cert_path = NULL;
+    }
+      
+    if(proxy_host) {
+        free(proxy_host);
+        proxy_host = NULL;
+    }
+        
+    if(password) {
+        free(password);
+        password = NULL;
+    }
+    
     return 0;
 }
 
+#endif
 
 
 

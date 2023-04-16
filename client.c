@@ -124,8 +124,6 @@ And then pass the path to cert.pem to the server initialization entrypoing
 #include "crypt.h"
 #include "tp/base64.h"
 
-#define DEBUG 1
-
 #define VROUTE_VERSION "1.0.0"
 
 #define CHALLENGE_DEFAULT_SIZE 64
@@ -157,6 +155,8 @@ And then pass the path to cert.pem to the server initialization entrypoing
 
 #define MAX_HOSTNAME_SIZE 255
 
+#define DUMMY_RESPONSE_RECV -1337
+
 #if DEBUG
 
 #define VR_LOG(...) vr_log(__func__, __VA_ARGS__)
@@ -164,8 +164,6 @@ And then pass the path to cert.pem to the server initialization entrypoing
 
 #define MAX_LOG_MESSAGE_SIZE 4096
 #define LOG_PREFIX_STR "[VROUTE]"
-
-#define DUMMY_RESPONSE_RECV -1337
 
 typedef enum {
     UNKNOWN_LOG_LEVEL = 0,
@@ -428,8 +426,6 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
     int r = 0;
     int rx = 0;
     char *ptr = NULL;
-    BIO *s_rbio = NULL;
-    int s_fd = -1;
     int sock_m = -1;
 
     if(sock < 0 || !data || !data_sz)
@@ -546,7 +542,7 @@ int open_http_conn(char *host, int port, int is_https, SSL **c_ssl) {
     X509_NAME *cert_name = NULL;
     X509_NAME *issuer_name = NULL;
     int sock = 0;
-    struct sockaddr_in srvaddr, cli;
+    struct sockaddr_in srvaddr;
     char *name = NULL;
 
     if(!host || port == 0 || !c_ssl)
@@ -649,7 +645,6 @@ ssize_t send_http_data(char *host, int port, char **data, size_t *data_size, int
     char *port_str = NULL;
     size_t http_req_sz = 0;
     SSL *c_ssl = NULL;
-    char *b64_encoded = NULL;
     size_t b64_out_sz = 0;
     char *data_x = NULL;
     size_t data_sz_x = 0;
@@ -662,7 +657,7 @@ ssize_t send_http_data(char *host, int port, char **data, size_t *data_size, int
     data_x = *data;
     data_sz_x = *data_size;
 
-    http_str = base64_encode(data_x, data_sz_x, &b64_out_sz);
+    http_str = (char *)base64_encode((unsigned char *)data_x, data_sz_x, &b64_out_sz);
     if(http_str == NULL) {
         VR_LOG(LOG_ERROR, "Error when trying to do base64 encoding");
         return -1;
@@ -752,7 +747,6 @@ ssize_t recv_http_data(char *host, int port, char **data, size_t *data_size, int
     size_t data_sz_x = 0;
     char *tmp_p = NULL;
     char *data_s = NULL;
-    size_t data_s_sz = 0;
     SSL *c_ssl = NULL;
     char *b64_decoded = NULL;
     size_t b64_decoded_sz = 0;
@@ -882,7 +876,7 @@ ssize_t recv_http_data(char *host, int port, char **data, size_t *data_size, int
     
     hexdump("base64 encoded data", data_s, strlen(data_s));
 
-    b64_decoded = base64_decode(data_s, strlen(data_s), &b64_decoded_sz);
+    b64_decoded = (char *)base64_decode((unsigned char *)data_s, strlen(data_s), &b64_decoded_sz);
     if(!b64_decoded) {
         if(data_x) {
             free(data_x);
@@ -981,7 +975,7 @@ ssize_t ctl_recv_data(int sock, char *host, int port, char **data, size_t *data_
 
 int connect_ctl_srv(char *host, int port) {
     int sock = 0;
-    struct sockaddr_in srvaddr, cli;
+    struct sockaddr_in srvaddr;
 
     if(!host || port == 0)
         return 0;
@@ -1011,7 +1005,6 @@ int connect_ctl_srv(char *host, int port) {
 }
 
 int send_cmd(char *cmd, size_t cmd_sz) {
-    ssize_t r = 0;
     ssize_t rx = 0;
     char *tlv_packet = NULL;
     tlv_header *tlv_p = NULL;
@@ -1147,11 +1140,60 @@ int channel_id_exists(int channel_id) {
     return 1;
 }
 
+void close_channel_conn(int sock) {
+    if(sock == -1)
+        return;
+
+    close_wrp(sock);
+
+    return;
+}
+
+int close_channel(int channel_id) {
+    int idx = -1;
+
+    if(channel_id <= 0)
+        return 0;
+
+    pthread_mutex_lock(&glb_conn_lock);
+
+    for(int i = 0 ; i < MAX_CONCURRENT_CHANNELS ; i++) {
+        if(global_conn[i].channel_id != 0 && global_conn[i].channel_id == channel_id) {
+            idx = i;
+            break;
+        }
+    }
+
+    if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Could not find channel_id (%d) in global conn", channel_id);
+        pthread_mutex_unlock(&glb_conn_lock);
+        return 0;
+    }
+
+    global_conn[idx].port = 0;
+
+    if(global_conn[idx].host) {
+        free(global_conn[idx].host);
+        global_conn[idx].host = NULL;
+    }
+
+    if(global_conn[idx].sock != -1) {
+        close_channel_conn(global_conn[idx].sock);
+        global_conn[idx].sock = -1;
+    }
+
+    global_conn[idx].channel_id = 0;
+
+    pthread_mutex_unlock(&glb_conn_lock);
+
+    return 1;
+}
+
 int open_channel_conn(int channel_id, char *host, int port) {
     int sock = 0;
     int idx = -1;
     int found = 0;
-    struct sockaddr_in srvaddr, cli;
+    struct sockaddr_in srvaddr;
     struct timeval timeout;
 
     if(!host || port == 0)
@@ -1228,55 +1270,6 @@ int open_channel_conn(int channel_id, char *host, int port) {
     VR_LOG(LOG_INFO, "Opened connection. Channel ID: %d", channel_id);
 
     return channel_id;
-}
-
-void close_channel_conn(int sock) {
-    if(sock == -1)
-        return;
-
-    close_wrp(sock);
-
-    return;
-}
-
-int close_channel(int channel_id) {
-    int idx = -1;
-
-    if(channel_id <= 0)
-        return 0;
-
-    pthread_mutex_lock(&glb_conn_lock);
-
-    for(int i = 0 ; i < MAX_CONCURRENT_CHANNELS ; i++) {
-        if(global_conn[i].channel_id != 0 && global_conn[i].channel_id == channel_id) {
-            idx = i;
-            break;
-        }
-    }
-
-    if(idx == -1) {
-        VR_LOG(LOG_ERROR, "Could not find channel_id (%d) in global conn", channel_id);
-        pthread_mutex_unlock(&glb_conn_lock);
-        return 0;
-    }
-
-    global_conn[idx].port = 0;
-
-    if(global_conn[idx].host) {
-        free(global_conn[idx].host);
-        global_conn[idx].host = NULL;
-    }
-
-    if(global_conn[idx].sock != -1) {
-        close_channel_conn(global_conn[idx].sock);
-        global_conn[idx].sock = -1;
-    }
-
-    global_conn[idx].channel_id = 0;
-
-    pthread_mutex_unlock(&glb_conn_lock);
-
-    return 1;
 }
 
 int get_sock_by_channel_id(int channel_id) {
@@ -1532,10 +1525,10 @@ char *get_challenge_solution(char *challenge, size_t size, size_t *out_size, cha
 
 uint32_t do_tcp_handshake(int sock, char *key, size_t key_sz) {
     int r = 0;
-    char chall[CHALLENGE_DEFAULT_SIZE + 1] = { 0 };
     size_t out_size = 0;
     char *p = NULL;
     uint32_t cid = 0;
+    char chall[CHALLENGE_DEFAULT_SIZE + 1] = { 0 };
     
     if(sock < 0 || !key || key_sz == 0)
        return 0;
@@ -1590,7 +1583,6 @@ uint32_t do_tcp_handshake(int sock, char *key, size_t key_sz) {
 
 uint32_t do_http_handshake(char *host, int port, int is_https, char *key, size_t key_sz) {
     ssize_t r = 0;
-    char chall[CHALLENGE_DEFAULT_SIZE + 1] = { 0 };
     char *p = NULL;
     char *s = NULL;
     size_t r_out_sz = 0;
@@ -1727,7 +1719,6 @@ void relay_poll(char *host, int port, proto_t proto) {
     size_t n = 0;
     int ch_id = 0;
     char dummy = 0;
-    int r = 0;
     ssize_t rx = 0;
     int r0 = 0;
     char i_recv_buf[sizeof(tlv_header)] = { 0 };
@@ -1735,7 +1726,6 @@ void relay_poll(char *host, int port, proto_t proto) {
     char *rdata_buf = NULL;
     size_t rdata_buf_sz = 0;
     char *data_buf = NULL;
-    size_t data_buf_sz = 0;
     tlv_header *tlv_buf = NULL;
     struct timeval tv;
     fd_set rfds;
@@ -2136,12 +2126,8 @@ int is_valid_proxy_or_relay_port(int port) {
 
 int start_relay_conn(char *host, int port, proto_t proto, char *key, size_t key_sz) {
     int ctl_sock = 0;
-    int r = 0;
     int x = 0;
-    ssize_t rx = 0;
     int ret = 0;
-    char *data = NULL;
-    size_t data_sz = 0;
     int consec_err = 0;
     
     VR_LOG(LOG_INFO, "Starting VROUTE client version '%s'...", VROUTE_VERSION);
@@ -2259,15 +2245,75 @@ int start_relay_conn(char *host, int port, proto_t proto, char *key, size_t key_
     return 1;
 }
 
-#define PSK "p@ssw0rd_3241!!=#"
+#if !COMPILE_AS_LIBRARY
 
-int main(void) {
-    if(!start_relay_conn("127.0.0.1", 1337, HTTPS_COM_PROTO, PSK, strlen(PSK))) {
+void usage(void) {
+    printf("==== { VROUTE CLIENT: USAGE } ===\n");
+    printf("\n[0] => HTTPS protocol\n[1] => HTTP protocol\n[2] => Raw TCP protocol\n\n");
+    printf("./vrouteclt <relay ip> <relay port> <protocol> <password>\n\n");
+    printf("  Eg.: ./vroutectl 1.2.3.4 1337 0 p@ssw0rd1234#\n\n");
+    return;
+}
+
+int main(int argc, char *argv[]) {
+    char *relay_host = NULL;
+    int relay_port = 0;
+    int proto_n = 0;
+    char *password = NULL;
+    proto_t protocol = 0;
+    
+    if(argc != 5) {
+        usage();
+        return 0;
+    }
+    
+    relay_host = strdup(argv[1]);
+    relay_port = atoi(argv[2]);
+    proto_n = atoi(argv[3]);
+    
+    if(proto_n == 0) {
+        protocol = HTTPS_COM_PROTO;
+    } else if(proto_n == 1) {
+        protocol = HTTP_COM_PROTO;
+    } else if(proto_n == 2) {
+        protocol = TCP_COM_PROTO;
+    } else {
+        usage();
+        return 0;
+    }
+    
+    password = strdup(argv[4]);
+    
+    if(!start_relay_conn(relay_host, relay_port, protocol, password, strlen(password))) {
         VR_LOG(LOG_ERROR, "Unknown error occurred");
+        
+        if(relay_host) {
+            free(relay_host);
+            relay_host = NULL;
+        }
+        
+        if(password) {
+            free(password);
+            password = NULL;
+        }
+        
         return 1;
     }
+    
+    if(relay_host) {
+        free(relay_host);
+        relay_host = NULL;
+    }
+        
+    if(password) {
+        free(password);
+        password = NULL;
+    }
+    
     return 0;
 }
+
+#endif
 
 
 

@@ -1,9 +1,21 @@
 #!/bin/bash
 
-clang -g -c tp/base64.c tp/base64.o
-clang -g -c util.c -o util.o
-clang -g -c crypt.c -o crypt.o
+if [[ "$1" == "debug" ]]; then
+    BUILD_FLAG="BUILD_DEBUG=1"
+elif [[ "$1" == "release" ]]; then
+    BUILD_FLAG="BUILD_RELEASE=1"
+elif [[ "$1" == "dev" ]]; then
+    BUILD_FLAG="BUILD_DEV=1"
+else
+    echo "Error: First argument must be 'debug', 'release' or 'dev'"
+    exit 1
+fi
 
-clang -fsanitize=address -DCLIENT_COMPILE=1 -g client.c -o client -lssl -lcrypto -lpthread util.o crypt.o tp/base64.o
+make $BUILD_FLAG
 
-clang -fsanitize=address -DSERVER_COMPILE=1 -g server.c -o server -lssl -lcrypto -lpthread util.o crypt.o tp/base64.o
+if [[ "$1" == "release" ]]; then
+    strip vroutesrv
+    strip vrouteclt
+    strip libvroute_client.so
+    strip libvroute_server.so
+fi

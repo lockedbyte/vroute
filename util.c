@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <time.h>
+#include <ctype.h>
 
 #include "util.h"
 
@@ -33,17 +34,17 @@ int file_exists(const char *path) {
     return 0;
 }
 
-void __hexdump(char *func_name, char *tag, void *mem, size_t len) {
+void __hexdump(const char *func_name, char *tag, void *mem, size_t len) {
     unsigned int i = 0, j = 0;
     
-    if(!func_name, !tag || !mem || len == 0)
+    if(!func_name || !tag || !mem || len == 0)
         return;
         
     printf("\n%s %s: %s:\n\n", PREFIX_HEXDUMP_OUTPUT, func_name, tag);
         
     for(i = 0 ; i < len + ((len % HEXDUMP_COLS) ? (HEXDUMP_COLS - len % HEXDUMP_COLS) : 0) ; i++) {
-        if(i % HEXDUMP_COLS == 0)
-            printf("\t0x%06x: ", i);
+            if(i % HEXDUMP_COLS == 0)
+                printf("\t0x%06x: ", i);
 
             if(i < len)
                 printf("%02x ", 0xFF & ((char*)mem)[i]);

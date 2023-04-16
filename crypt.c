@@ -23,8 +23,6 @@
 
 #include "crypt.h"
 
-#define DEBUG 1
-
 #if DEBUG
 
 #define VR_LOG(...) vr_log_c(__func__, __VA_ARGS__)
@@ -133,49 +131,78 @@ char *sha256_hash(char *data, size_t size, size_t *out_sz) {
     return hash;
 }
 
-char *PKCS7_pad(char *data, size_t data_size, int block_size, size_t *output_size) {
-    if (data_size == 0) {
-        *output_size = block_size;
-        return malloc(block_size);
+char *PKCS7_pad(char *data, size_t data_sz, int block_size, size_t *out_size) {
+    char *p = NULL;
+    size_t pad_size = 0;
+    
+    if(!data || block_size < 0 || !out_size)
+        return NULL;
+        
+    *out_size = 0;
+        
+    if(data_sz == 0) {
+        *out_size = block_size;
+        
+        p = calloc(block_size, sizeof(char));
+        if(!p)
+            return NULL;
+            
+        return p;
     }
     
-    size_t pad_size = block_size - (data_size % block_size);
-    *output_size = data_size + pad_size;
+    pad_size = block_size - (data_sz % block_size);
     
-    char *output_data = malloc(*output_size);
-    memcpy(output_data, data, data_size);
-    memset(output_data + data_size, pad_size, pad_size);
+    *out_size = data_sz + pad_size;
     
-    return output_data;
+    p = calloc((data_sz + pad_size), sizeof(char));
+    if(!p)
+        return NULL;
+        
+    memcpy(p, data, data_sz);
+    memset(p + data_sz, pad_size, pad_size);
+    
+    return p;
 }
 
-char *PKCS7_unpad(char *data, size_t data_size, int block_size, size_t *output_size) {
-    if (data_size % block_size != 0 || data_size == 0) {
-        *output_size = 0;
+char *PKCS7_unpad(char *data, size_t data_sz, int block_size, size_t *out_size) {
+    char *p = NULL;
+    char pad_value = 0;
+
+    if(!data || block_size < 0 || !out_size)
+        return NULL;
+        
+    *out_size = 0;
+
+    if((data_sz % block_size) != 0 || data_sz == 0) {
+        *out_size = 0;
         VR_LOG(LOG_ERROR, "Error: data size not AES_BLOCK_SIZE-aligned for unpadding...");
         return NULL;
     }
     
-    char pad_value = data[data_size - 1];
+    pad_value = data[data_sz - 1];
     if (pad_value == 0 || pad_value > block_size) {
-        *output_size = 0;
+        *out_size = 0;
         VR_LOG(LOG_ERROR, "Last value for padding is wrong, corrupted data stream or non-padded data provided...");
         return NULL;
     }
     
-    for (size_t i = data_size - pad_value ; i < data_size ; i++) {
+    for (size_t i = data_sz - pad_value ; i < data_sz ; i++) {
         if (data[i] != pad_value) {
-            *output_size = 0;
+            *out_size = 0;
             VR_LOG(LOG_ERROR, "Invalid pad value, corrupted data stream or non-padded data provided...");
             return NULL;
         }
     }
     
-    *output_size = data_size - pad_value;
-    unsigned char *output_data = malloc(*output_size);
-    memcpy(output_data, data, *output_size);
+    *out_size = data_sz - pad_value;
     
-    return output_data;
+    p = calloc((data_sz - pad_value), sizeof(char));
+    if(!p)
+        return NULL;
+        
+    memcpy(p, data, (data_sz - pad_value));
+    
+    return p;
 }
 
 #if 0
@@ -240,7 +267,7 @@ char *encrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
     
     hexdump("cleartext data", data, data_sz);
       
-    AES_set_encrypt_key(h_key, 256, &aes_key);
+    AES_set_encrypt_key((unsigned char *)h_key, 256, &aes_key);
   
     iv = generate_random_iv(&out_iv_sz);
     if(!iv || out_iv_sz != AES_IV_SIZE) {
@@ -311,7 +338,7 @@ char *encrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
         return NULL;
     }
   
-    AES_cbc_encrypt((unsigned char *)padded, (unsigned char *)(ciphertext + AES_IV_SIZE), padded_size, &aes_key, iv_bak, AES_ENCRYPT);
+    AES_cbc_encrypt((unsigned char *)padded, (unsigned char *)(ciphertext + AES_IV_SIZE), padded_size, &aes_key, (unsigned char *)iv_bak, AES_ENCRYPT);
     
     memcpy(ciphertext, iv, AES_IV_SIZE);
   
@@ -371,7 +398,7 @@ char *decrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
         return NULL;
     }
       
-    AES_set_decrypt_key(h_key, 256, &aes_key);
+    AES_set_decrypt_key((unsigned char *)h_key, 256, &aes_key);
   
     iv = memdup(data, AES_IV_SIZE);
     if(!iv) {
@@ -398,7 +425,7 @@ char *decrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
         return NULL;
     }
   
-    AES_cbc_encrypt((unsigned char *)(data + AES_IV_SIZE), (unsigned char *)cleartext, data_sz - AES_IV_SIZE, &aes_key, iv, AES_DECRYPT);
+    AES_cbc_encrypt((unsigned char *)(data + AES_IV_SIZE), (unsigned char *)cleartext, data_sz - AES_IV_SIZE, &aes_key, (unsigned char *)iv, AES_DECRYPT);
   
     if(iv) {
         free(iv);
@@ -441,7 +468,6 @@ char *encrypt_challenge(char *data, size_t data_sz, char *key, size_t key_sz, si
     char *h_key = NULL;
     size_t h_sz = 0;
     AES_KEY aes_key;
-    size_t out_iv_sz = 0;
     char *ciphertext = NULL;
     size_t ciphertext_sz = 0;
     char *padded = NULL;
@@ -458,7 +484,7 @@ char *encrypt_challenge(char *data, size_t data_sz, char *key, size_t key_sz, si
         return NULL;
     }
       
-    AES_set_encrypt_key(h_key, 256, &aes_key);
+    AES_set_encrypt_key((unsigned char *)h_key, 256, &aes_key);
     
     hexdump("challenge", data, data_sz);
   
@@ -491,7 +517,8 @@ char *encrypt_challenge(char *data, size_t data_sz, char *key, size_t key_sz, si
     }
   
     for(int i = 0 ; i < (padded_size / AES_BLOCK_SIZE) ; i++)
-        AES_ecb_encrypt(padded + (i * AES_BLOCK_SIZE), ciphertext + (i * AES_BLOCK_SIZE), &aes_key, AES_ENCRYPT);
+        AES_ecb_encrypt((unsigned char *)(padded + (i * AES_BLOCK_SIZE)),
+                         (unsigned char *)(ciphertext + (i * AES_BLOCK_SIZE)), &aes_key, AES_ENCRYPT);
         
     hexdump("encrypted challenge", ciphertext, ciphertext_sz);
   
