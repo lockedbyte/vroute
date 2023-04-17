@@ -216,7 +216,7 @@ char *encrypt_data(char *data, size_t data_sz, char *key, size_t key_sz, size_t 
     size_t padded_size = 0;
     char *iv = NULL;
     char *iv_bak = NULL;
-  
+    
     if(!data || data_sz == 0 || !key || key_sz == 0 || !out_size)
         return NULL;
     

@@ -7,35 +7,6 @@ Repository: https://github.com/lockedbyte/vroute
 A brief message
 ===================
 
-One of the main features of this project is allowing multiple clients in the
-relay-server side acting as nodes from where to route our connections into
-destinations we are unable to access directly.
-
-The current approach is request feedback from every node callbacking into the
-relay-server as part of the polling loop, this way checking one by one in all
-of them whether they have access to the destination or not.
-
-This has an extreme performance overhead, especially not because we need to
-iterate over every node, but because we use the HTTP-style of communication,
-so we rely on the client to connect to us first so that we can request such
-destination rechability check.
-
-For this reason, I apply a timeout that, once reached, and if no client reported
-a FORWARD_CONNECTION_SUCCCESS command, we consider the destination as unrechable.
-
-This approach would be much faster with raw TCP, but in some environments HTTP(S)
-is a must to bypass firewalls and other defensive solutions.
-
-In conclusion, there is a bottleneck problem related to this connection-opening
-feature, which might turn the server slow if a SOCKS client eventually attempts
-to open a big amount of connections in bulk. This will in turn, make the connection
-opening process slow as it will have to go through every client, until the timeout
-is reached or one of the clients reply with FORWARD_CONNECTION_SUCCESS.
-
-There is though a possible solution to speed up and improve performance which is
-adding more global references representing "connection-opening requests" so that
-multiple connections can be opened simultaneously.
-
 It is advised, if you are using proxychains as your SOCKS proxy client, to change
 in /etc/proxychains.conf these values to the following:
 
@@ -50,7 +21,6 @@ Future additions
 ==================
 
 - change encryption to the new OpenSSL encryption escheme using EVP
-- improve performance of route discovery allowing multiple instances simultaneously
 - allow second-order connections for nodes to increase remote accessibility within the network map
 
 
@@ -138,6 +108,9 @@ And then pass the path to cert.pem to the server initialization entrypoing
 #define COMMAND_CHANNEL 0
 
 #define RELAY_TIMEOUT 60
+
+#define PNG_FAKE_HDR "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"
+#define PNG_FAKE_HDR_SIZE 8
 
 #define MAX_CONCURRENT_CHANNELS 4096
 
@@ -279,7 +252,7 @@ SSL_CTX *_ctx = NULL;
 X509 *_cert = NULL;
 
 int client_id = 0;
-uint64_t handshake_sess_id = 0;
+int handshake_sess_id = 0;
 
 pthread_mutex_t glb_conn_lock;
 pthread_mutex_t main_loop_sock;
@@ -370,8 +343,8 @@ void destroy_ssl(void) {
     return;
 }
 
-uint64_t generate_handshake_sess_id(void) {
-    uint64_t sess_id = (rand() % (MAX_HANDSHAKE_SESS_ID - MIN_HANDSHAKE_SESS_ID + 1)) + MIN_HANDSHAKE_SESS_ID;
+int generate_handshake_sess_id(void) {
+    int sess_id = (rand() % (MAX_HANDSHAKE_SESS_ID - MIN_HANDSHAKE_SESS_ID + 1)) + MIN_HANDSHAKE_SESS_ID;
     return sess_id;
 } 
 
@@ -427,6 +400,8 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
     int rx = 0;
     char *ptr = NULL;
     int sock_m = -1;
+    int tries = 0;
+    int max_tries = 4;
 
     if(sock < 0 || !data || !data_sz)
         return -1;
@@ -454,20 +429,32 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
         sock_m = sock;
     }
   
-    #if WINDOWS_OS
-    r = ioctlsocket(sock_m, FIONREAD, &bytes_available);
-    #else
-    r = ioctl(sock_m, FIONREAD, &bytes_available);
-    #endif
-    if(r < 0) {
-        VR_LOG(LOG_ERROR, "Error at ioctl() for FIONREAD");
-        return -1;
-    }
+    while(tries < max_tries) {
+        #if WINDOWS_OS
+        r = ioctlsocket(sock_m, FIONREAD, &bytes_available);
+        #else
+        r = ioctl(sock_m, FIONREAD, &bytes_available);
+        #endif
+        if(r < 0) {
+            VR_LOG(LOG_ERROR, "Error at ioctl() for FIONREAD");
+            return -1;
+        }
 
-    if(bytes_available < 0) {
-        *data = NULL;
-        *data_sz = 0;
-        return 0;
+        if(bytes_available < 0) {
+            *data = NULL;
+            *data_sz = 0;
+            return 0;
+        }
+
+        if(bytes_available == 0) {
+            VR_LOG(LOG_DEBUG, "No data received, giving a new opportunity (%d/%d)...", tries, max_tries);
+        } else {
+            break;
+        }
+        
+        sleep(1);
+
+        tries++;
     }
     
     VR_LOG(LOG_DEBUG, "There are %ld bytes available", bytes_available);
@@ -650,6 +637,11 @@ ssize_t send_http_data(char *host, int port, char **data, size_t *data_size, int
     size_t data_sz_x = 0;
     char *dummy_rsp = NULL;
     size_t dummy_sz = 0;
+    char *enc_id = NULL;
+    size_t enc_id_sz = 0;
+    char *b64_id = NULL;
+    size_t b64_id_sz = 0;
+    uint32_t i_id = 0;
 
     if(!host || port <= 0 || !data || !data_size)
         return -1;
@@ -662,27 +654,67 @@ ssize_t send_http_data(char *host, int port, char **data, size_t *data_size, int
         VR_LOG(LOG_ERROR, "Error when trying to do base64 encoding");
         return -1;
     }
+    
+    if(http_str[strlen(http_str) - 1] == 0x0a)
+        http_str[strlen(http_str) - 1] = '\0';
 
     asprintf(&port_str, ":%d", port);
+    
+    if(handshake_sess_id != 0 && client_id == 0) {
+        i_id = handshake_sess_id;
+    } else {
+        i_id = client_id;
+    }
+    
+    VR_LOG(LOG_DEBUG, "i_id: %d", i_id);
+    
+    enc_id = encrypt_data((char *)&i_id, sizeof(uint32_t), _key, _key_sz, &enc_id_sz);
+    if(!enc_id || enc_id_sz == 0) {
+        VR_LOG(LOG_ERROR, "Error when trying to encrypt ID");
+        return -1;
+    }
+    
+    b64_id = (char *)base64_encode((unsigned char *)enc_id, enc_id_sz, &b64_id_sz);
+    if(b64_id == NULL || b64_id_sz == 0) {
+        if(enc_id) {
+            free(enc_id);
+            enc_id = NULL;
+        }
+        VR_LOG(LOG_ERROR, "Error when trying to do base64 encoding");
+        return -1;
+    }
+    
+    if(b64_id[strlen(b64_id) - 1] == 0x0a)
+        b64_id[strlen(b64_id) - 1] = '\0';
   
     if(handshake_sess_id != 0 && client_id == 0) {
-        asprintf(&http_req, "POST %s?h=%ld HTTP/1.1\r\n"
+        asprintf(&http_req, "POST %s?h=%s HTTP/1.1\r\n"
                   "Host: %s%s\r\n"
                   "User-Agent: %s\r\n"
                   "Accept: */*\r\n"
                   "Content-Length: %lu\r\n"
-                  "\r\ntoken=%s; expire=0;", DEFAULT_HTTP_PATH, handshake_sess_id, host, (port == 80) ? "" : port_str,
+                  "\r\ntoken=%s; expire=0;", DEFAULT_HTTP_PATH, b64_id, host, (port == 80) ? "" : port_str,
                             DEFAULT_HTTP_USER_AGENT, strlen(http_str) + 11, http_str);
     } else {
-        asprintf(&http_req, "POST %s?cid=%d HTTP/1.1\r\n"
+        asprintf(&http_req, "POST %s?cid=%s HTTP/1.1\r\n"
                   "Host: %s%s\r\n"
                   "User-Agent: %s\r\n"
                   "Accept: */*\r\n"
                   "Content-Length: %lu\r\n"
-                  "\r\ntoken=%s; expire=0;", DEFAULT_HTTP_PATH, client_id, host, (port == 80) ? "" : port_str,
+                  "\r\ntoken=%s; expire=0;", DEFAULT_HTTP_PATH, b64_id, host, (port == 80) ? "" : port_str,
                             DEFAULT_HTTP_USER_AGENT, strlen(http_str) + 11, http_str);
     }
 
+    if(b64_id) {
+        free(b64_id);
+        b64_id = NULL;
+    }
+    
+    if(enc_id) {
+        free(enc_id);
+        enc_id = NULL;
+    }
+    
     if(port_str) {
         free(port_str);
         port_str = NULL;
@@ -723,7 +755,7 @@ ssize_t send_http_data(char *host, int port, char **data, size_t *data_size, int
         VR_LOG(LOG_ERROR, "Received a non-OK HTTP response");
         return -1;
     }
-
+    
     if(dummy_rsp) {
         free(dummy_rsp);
         dummy_rsp = NULL;
@@ -753,6 +785,13 @@ ssize_t recv_http_data(char *host, int port, char **data, size_t *data_size, int
     char *http_req = NULL;
     char *port_str = NULL;
     size_t http_req_sz = 0;
+    char *f_data = NULL;
+    size_t f_data_sz = 0;
+    char *enc_id = NULL;
+    size_t enc_id_sz = 0;
+    char *b64_id = NULL;
+    size_t b64_id_sz = 0;
+    uint32_t i_id = 0;
 
     if(!host || port <= 0 || !data || !data_size)
         return -1;
@@ -767,22 +806,49 @@ ssize_t recv_http_data(char *host, int port, char **data, size_t *data_size, int
     }
 
     asprintf(&port_str, ":%d", port);
+    
+    if(handshake_sess_id != 0 && client_id == 0) {
+        i_id = handshake_sess_id;
+    } else {
+        i_id = client_id;
+    }
+    
+    VR_LOG(LOG_DEBUG, "i_id: %d", i_id);
+    
+    enc_id = encrypt_data((char *)&i_id, sizeof(uint32_t), _key, _key_sz, &enc_id_sz);
+    if(!enc_id || enc_id_sz == 0) {
+        VR_LOG(LOG_ERROR, "Error when trying to encrypt ID");
+        return -1;
+    }
+    
+    b64_id = (char *)base64_encode((unsigned char *)enc_id, enc_id_sz, &b64_id_sz);
+    if(b64_id == NULL || b64_id_sz == 0) {
+        if(enc_id) {
+            free(enc_id);
+            enc_id = NULL;
+        }
+        VR_LOG(LOG_ERROR, "Error when trying to do base64 encoding");
+        return -1;
+    }
+    
+    if(b64_id[strlen(b64_id) - 1] == 0x0a)
+        b64_id[strlen(b64_id) - 1] = '\0';
 
-    if(handshake_sess_id != 0 || client_id == 0) {
-        asprintf(&http_req, "GET %s?h=%ld HTTP/1.1\r\n"
+    if(handshake_sess_id != 0 && client_id == 0) {
+        asprintf(&http_req, "GET %s?h=%s HTTP/1.1\r\n"
                   "Host: %s%s\r\n"
                   "User-Agent: %s\r\n"
                   "Accept: */*\r\n"
                   "Content-Length: 0\r\n"
-                  "\r\n", DEFAULT_HTTP_PATH, handshake_sess_id, host, (port == 80) ? "" : port_str,
+                  "\r\n", DEFAULT_HTTP_PATH, b64_id, host, (port == 80) ? "" : port_str,
                             DEFAULT_HTTP_USER_AGENT);
     } else {
-        asprintf(&http_req, "GET %s?cid=%d HTTP/1.1\r\n"
+        asprintf(&http_req, "GET %s?cid=%s HTTP/1.1\r\n"
                   "Host: %s%s\r\n"
                   "User-Agent: %s\r\n"
                   "Accept: */*\r\n"
                   "Content-Length: 0\r\n"
-                  "\r\n", DEFAULT_HTTP_PATH, client_id, host, (port == 80) ? "" : port_str,
+                  "\r\n", DEFAULT_HTTP_PATH, b64_id, host, (port == 80) ? "" : port_str,
                             DEFAULT_HTTP_USER_AGENT);
     }
 
@@ -796,6 +862,16 @@ ssize_t recv_http_data(char *host, int port, char **data, size_t *data_size, int
     }
     
     sleep(1);
+    
+    if(b64_id) {
+        free(b64_id);
+        b64_id = NULL;
+    }
+    
+    if(enc_id) {
+        free(enc_id);
+        enc_id = NULL;
+    }
 
     if(http_req) {
         free(http_req);
@@ -885,18 +961,61 @@ ssize_t recv_http_data(char *host, int port, char **data, size_t *data_size, int
         VR_LOG(LOG_ERROR, "Error when doing base64 decoding");
         return -1;
     }
+    
+    if(b64_decoded_sz < PNG_FAKE_HDR_SIZE) {
+        if(data_x) {
+            free(data_x);
+            data_x = NULL;
+        }
+
+        if(b64_decoded) {
+            free(b64_decoded);
+            b64_decoded = NULL;
+        }
+        VR_LOG(LOG_ERROR, "Base64 decoded data is less than PNG_FAKE_HDR_SIZE (%d)", PNG_FAKE_HDR_SIZE);
+        return -1;
+    }
+    
+    if(memcmp(b64_decoded, PNG_FAKE_HDR, PNG_FAKE_HDR_SIZE) != 0) {
+        if(data_x) {
+            free(data_x);
+            data_x = NULL;
+        }
+
+        if(b64_decoded) {
+            free(b64_decoded);
+            b64_decoded = NULL;
+        }
+        VR_LOG(LOG_ERROR, "Base64 decoded data does not have fake PNG header");
+        return -1;
+    }
 
     if(data_x) {
         free(data_x);
         data_x = NULL;
     }
-
-    if(data && data_size) {
-        *data = b64_decoded;
-        *data_size = b64_decoded_sz;
+    
+    f_data_sz = (b64_decoded_sz - PNG_FAKE_HDR_SIZE);
+    f_data = memdup(b64_decoded + PNG_FAKE_HDR_SIZE, f_data_sz);
+    if(!f_data) {
+        if(b64_decoded) {
+            free(b64_decoded);
+            b64_decoded = NULL;
+        }
+        return -1;
+    }
+    
+    if(b64_decoded) {
+        free(b64_decoded);
+        b64_decoded = NULL;
     }
 
-    return b64_decoded_sz;
+    if(data && data_size) {
+        *data = f_data;
+        *data_size = f_data_sz;
+    }
+
+    return f_data_sz;
 }
 
 ssize_t ctl_send_data(int sock, char *host, int port, char **data, size_t *data_size, proto_t proto) {
@@ -1599,7 +1718,7 @@ uint32_t do_http_handshake(char *host, int port, int is_https, char *key, size_t
     }
     
     if(r == DUMMY_RESPONSE_RECV) {
-        VR_LOG(LOG_ERROR, "Server sent us a dummy response within the middle of handshake (1)");
+        VR_LOG(LOG_ERROR, "Server rejected our handshake: possibly wrong authentication");
         return 0;
     }
        
@@ -1650,7 +1769,7 @@ uint32_t do_http_handshake(char *host, int port, int is_https, char *key, size_t
     }
     
     if(r == DUMMY_RESPONSE_RECV) {
-        VR_LOG(LOG_ERROR, "Server sent us a dummy response within the middle of handshake (2)");
+        VR_LOG(LOG_ERROR, "Server rejected handshake: possibly wrong authentication (2)");
         return 0;
     }
        
@@ -2153,6 +2272,9 @@ int start_relay_conn(char *host, int port, proto_t proto, char *key, size_t key_
 
     last_conn_time = 0;
     _ctl_sock = -1;
+    
+    _key = memdup(key, key_sz);
+    _key_sz = key_sz;
 
     while(x < 10) {
         srand((time(NULL) * getpid()) + clock() + ret);
@@ -2218,8 +2340,6 @@ int start_relay_conn(char *host, int port, proto_t proto, char *key, size_t key_
         _port = port;
         _ctl_sock = ctl_sock;
         _proto = proto;
-        _key = memdup(key, key_sz);
-        _key_sz = key_sz;
 
         VR_LOG(LOG_INFO, "Starting ping worker...");
         

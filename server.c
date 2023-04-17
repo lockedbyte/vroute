@@ -7,35 +7,6 @@ Repository: https://github.com/lockedbyte/vroute
 A brief message
 ===================
 
-One of the main features of this project is allowing multiple clients in the
-relay-server side acting as nodes from where to route our connections into
-destinations we are unable to access directly.
-
-The current approach is request feedback from every node callbacking into the
-relay-server as part of the polling loop, this way checking one by one in all
-of them whether they have access to the destination or not.
-
-This has an extreme performance overhead, especially not because we need to
-iterate over every node, but because we use the HTTP-style of communication,
-so we rely on the client to connect to us first so that we can request such
-destination rechability check.
-
-For this reason, I apply a timeout that, once reached, and if no client reported
-a FORWARD_CONNECTION_SUCCCESS command, we consider the destination as unrechable.
-
-This approach would be much faster with raw TCP, but in some environments HTTP(S)
-is a must to bypass firewalls and other defensive solutions.
-
-In conclusion, there is a bottleneck problem related to this connection-opening
-feature, which might turn the server slow if a SOCKS client eventually attempts
-to open a big amount of connections in bulk. This will in turn, make the connection
-opening process slow as it will have to go through every client, until the timeout
-is reached or one of the clients reply with FORWARD_CONNECTION_SUCCESS.
-
-There is though a possible solution to speed up and improve performance which is
-adding more global references representing "connection-opening requests" so that
-multiple connections can be opened simultaneously.
-
 It is advised, if you are using proxychains as your SOCKS proxy client, to change
 in /etc/proxychains.conf these values to the following:
 
@@ -50,7 +21,6 @@ Future additions
 ==================
 
 - change encryption to the new OpenSSL encryption escheme using EVP
-- improve performance of route discovery allowing multiple instances simultaneously
 - allow second-order connections for nodes to increase remote accessibility within the network map
 
 
@@ -143,6 +113,9 @@ And then pass the path to cert.pem to the server initialization entrypoing
 
 #define MAX_KEY_SIZE 64
 
+#define PNG_FAKE_HDR "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a"
+#define PNG_FAKE_HDR_SIZE 8
+
 #define DATA_PREFIX "<img src='data:image/jpeg;base64,"
 #define DATA_SUFFIX "' />"
 
@@ -165,8 +138,6 @@ And then pass the path to cert.pem to the server initialization entrypoing
 
 #define MAX_LOG_MESSAGE_SIZE 4096
 #define LOG_PREFIX_STR "[VROUTE]"
-
-char *get_route_req_open_cmd(int client_id, size_t *out_size);
 
 /*
 
@@ -299,6 +270,7 @@ pthread_mutex_t client_glb_conn_lock;
 pthread_mutex_t handshake_glb_conn_lock;
 pthread_mutex_t queue_glb_buf_lock;
 pthread_mutex_t dead_client_worker;
+pthread_mutex_t conn_req_lock;
 
 pthread_mutex_t iopen_lock;
 pthread_mutex_t route_open_lock;
@@ -317,7 +289,7 @@ void collect_dead_clients_worker(void) {
     
     // XXX: disable dead client collector
     //   to fix bug in which alive connections
-    //   being colledted
+    //   are being collected
     while(1) {}
     
     pthread_mutex_lock(&dead_client_worker);
@@ -341,10 +313,9 @@ void collect_dead_clients_worker(void) {
 }
 
 void ping_worker(void) {
-    long curr_time = 0;
     while(1) {
         sleep(10);
-        curr_time = time(NULL);
+
         if(close_srv) {
             pthread_exit(NULL);
             return;
@@ -1874,13 +1845,17 @@ int __interpret_remote_packet(int client_id, char *data, size_t data_sz) {
                     return 0;
                 }
                 
-                if(!is_route_discovery_in_process())
+                if(is_route_solved(cmd_p->channel_id)) {
+                    VR_LOG(LOG_DEBUG, "Route already solved by some other client, skipping...");
                     return 1;
+                } 
                 
+                /*
                 if(is_client_in_checked_list(cmd_p->channel_id)) {
                     VR_LOG(LOG_INFO, "This client has already been checked: No access to requested destination");
                     return 1;
                 }
+                */
                 
                 if(!mark_route_found(client_id, cmd_p->channel_id, found)) {
                     VR_LOG(LOG_ERROR, "Could not mark route as found");
@@ -2205,6 +2180,7 @@ int relay_tcp_srv_poll(int sock) {
     size_t enc_sz = 0;
     char *dec = NULL;
     size_t dec_sz = 0;
+    int ref_idx = -1;
   
     if(sock < 0) {
         err = 1;
@@ -2236,9 +2212,11 @@ int relay_tcp_srv_poll(int sock) {
             qdata = NULL;
         }
         
-        if(is_route_discovery_in_process() && !is_client_in_checked_list(cid)) {
+        ref_idx = is_route_discovery_in_process(cid);
+        
+        if(ref_idx >= 0) { // if(!is_client_in_checked_list_by_idx(cid, ref_idx, 0))
             VR_LOG(LOG_DEBUG, "There is a discovery process currently. Testing this node as a possible route...");
-            qdata = get_route_req_open_cmd(cid, &qsize);   
+            qdata = get_route_req_open_cmd(ref_idx, cid, &qsize);   
             if(!qdata || qsize == 0) {
                 VR_LOG(LOG_ERROR, "get_route_req_open_cmd() returned NULL...");
                 err = 1;
@@ -2411,6 +2389,8 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
     int rx = 0;
     char *ptr = NULL;
     int sock_m = -1;
+    int tries = 0;
+    int max_tries = 4;
 
     if(sock < 0 || !data || !data_sz)
         return -1;
@@ -2437,21 +2417,34 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
     } else {
         sock_m = sock;
     }
-  
-    #if WINDOWS_OS
-    r = ioctlsocket(sock_m, FIONREAD, &bytes_available);
-    #else
-    r = ioctl(sock_m, FIONREAD, &bytes_available);
-    #endif
-    if(r < 0) {
-        VR_LOG(LOG_ERROR, "Error at ioctl() with FIONREAD");
-        return -1;
-    }
+    
+    while(tries < max_tries) {
+        #if WINDOWS_OS
+        r = ioctlsocket(sock_m, FIONREAD, &bytes_available);
+        #else
+        r = ioctl(sock_m, FIONREAD, &bytes_available);
+        #endif
+        if(r < 0) {
+            VR_LOG(LOG_ERROR, "Error at ioctl() with FIONREAD");
+            return -1;
+        }
 
-    if(bytes_available < 0) {
-        *data = NULL;
-        *data_sz = 0;
-        return 0;
+        if(bytes_available < 0) {
+            *data = NULL;
+            *data_sz = 0;
+            return 0;
+        }
+        
+        if(bytes_available == 0) {
+            VR_LOG(LOG_DEBUG, "No data received, giving a new opportunity (%d/%d)...", tries, max_tries);
+        } else {
+            break;
+        }
+        
+        sleep(1);
+        
+        tries++;
+    
     }
     
     VR_LOG(LOG_DEBUG, "There are %ld bytes available", bytes_available);
@@ -2500,6 +2493,11 @@ int get_get_param(char *data, size_t data_sz, int is_handshake) {
     char *p3 = NULL;
     int found = 0;
     int param = 0;
+    char *dec_id = NULL;
+    size_t dec_id_sz = 0;
+    char *b64_dec_id = NULL;
+    size_t b64_dec_sz = 0;
+    uint32_t rec_id = 0;
 	
     if(!data || data_sz == 0 || is_handshake < 0)
         return -1;
@@ -2542,7 +2540,62 @@ int get_get_param(char *data, size_t data_sz, int is_handshake) {
         VR_LOG(LOG_ERROR, "Provided request is invalid");
         return -1;
     }
-           
+    
+    if(p3[strlen(p3) - 1] == 0x0a)
+        p3[strlen(p3) - 1] = '\0';
+    
+    b64_dec_id = (char *)base64_decode((unsigned char *)p3, strlen(p3), &b64_dec_sz);
+    if(!b64_dec_id || b64_dec_sz == 0) {
+        if(p) {
+            free(p);
+            p = NULL;
+        }
+        VR_LOG(LOG_ERROR, "Error trying to do base64 decoding");
+        return -1;
+    }
+    
+    dec_id = decrypt_data(b64_dec_id, b64_dec_sz, _key, _key_sz, &dec_id_sz);
+    if(!dec_id || dec_id_sz == 0) {
+        if(p) {
+            free(p);
+            p = NULL;
+        }
+
+        if(b64_dec_id) {
+            free(b64_dec_id);
+            b64_dec_id = NULL;
+        }
+        
+        VR_LOG(LOG_ERROR, "Error trying to decrypt data");
+        return -1;
+    }
+    
+    if(dec_id_sz != sizeof(uint32_t)) {
+        if(p) {
+            free(p);
+            p = NULL;
+        }
+
+        if(b64_dec_id) {
+            free(b64_dec_id);
+            b64_dec_id = NULL;
+        }
+
+        if(dec_id) {
+            free(dec_id);
+            dec_id = NULL;
+        }
+        
+        VR_LOG(LOG_ERROR, "Received encrypted ID is NOT the size of uint32_t (4 bytes)");
+        
+        return -1;
+    }
+    
+    memcpy((char *)&rec_id, dec_id, sizeof(uint32_t));
+    
+    VR_LOG(LOG_DEBUG, "rec_id: %d", rec_id);
+    
+    /*   
     param = atoi(p3);
     if(param <= 0) {
         if(p) {
@@ -2552,13 +2605,45 @@ int get_get_param(char *data, size_t data_sz, int is_handshake) {
         VR_LOG(LOG_ERROR, "Received parameter is invalid");
         return -1;
     }
+    */
+    
+    if(rec_id <= 0) {
+        if(p) {
+            free(p);
+            p = NULL;
+        }
+
+        if(b64_dec_id) {
+            free(b64_dec_id);
+            b64_dec_id = NULL;
+        }
+
+        if(dec_id) {
+            free(dec_id);
+            dec_id = NULL;
+        }
+        
+        VR_LOG(LOG_ERROR, "Received param is less than or equal to 0");
+        
+        return -1;
+    }
            
     if(p) {
         free(p);
         p = NULL;
     }
+    
+    if(b64_dec_id) {
+        free(b64_dec_id);
+        b64_dec_id = NULL;
+    }
+        
+    if(dec_id) {
+        free(dec_id);
+        dec_id = NULL;
+    }
            
-    return param;
+    return rec_id;
 }
 
 char *get_data_from_http(char *data, size_t data_sz, size_t *out_size) {
@@ -2631,17 +2716,37 @@ char *get_http_data_response(char *data, size_t data_sz, size_t *out_size) {
     size_t osz = 0;
     char *b64_p = NULL;
     size_t b64_sz = 0;
+    char *raw_d = NULL;
+    size_t raw_sz = 0;
   
     if(!data || data_sz == 0 || !out_size)
         return NULL;
     
     *out_size = 0;
+    
+    raw_sz = data_sz + PNG_FAKE_HDR_SIZE;
+    raw_d = calloc(raw_sz, sizeof(char));
+    if(!raw_d) {
+        *out_size = 0;
+        return NULL;
+    }
+    
+    memcpy(raw_d, PNG_FAKE_HDR, PNG_FAKE_HDR_SIZE);
+    memcpy(raw_d + PNG_FAKE_HDR_SIZE, data, data_sz);
   
-    b64_p = (char *)base64_encode((unsigned char *)data, data_sz, &b64_sz);
+    b64_p = (char *)base64_encode((unsigned char *)raw_d, raw_sz, &b64_sz);
     if(!b64_p || b64_sz == 0) {
         VR_LOG(LOG_ERROR, "Error trying to do base64 encoding");
         *out_size = 0;
         return NULL;
+    }
+
+    if(b64_p[strlen(b64_p) - 1] == 0x0a)
+        b64_p[strlen(b64_p) - 1] = '\0';
+        
+    if(raw_d) {
+        free(raw_d);
+        raw_d = NULL;
     }
   
     asprintf(&out, "HTTP/1.1 200 OK\r\n"
@@ -2649,7 +2754,6 @@ char *get_http_data_response(char *data, size_t data_sz, size_t *out_size) {
              "Content-Type: text/html; charset=ISO-8859-1\r\n"
              "X-XSS-Protection: 0\r\n"
              "X-Frame-Options: SAMEORIGIN\r\n"
-	     "Transfer-Encoding: chunked\r\n"
 	     "Set-Cookie: session=jnd82Nsb2VFDJdn25sAlF6sdD47wv\r\n"
 	     "Content-Length: %ld\r\n"
 	     "\r\n<!DOCTYPE html><html><head><title>image</title></head><body>%s%s%s</body></html>",
@@ -2665,17 +2769,21 @@ char *get_http_data_response(char *data, size_t data_sz, size_t *out_size) {
     return out;
 }
 
+/*
 int is_client_in_checked_list(int client_id) {
     int found = 0;
     
     if(client_id <= 0)
         return 0;
         
-    pthread_mutex_lock(&route_open_lock);
+    if(!conn_req_glb)
+        return 0;
+        
+    pthread_mutex_lock(&conn_req_lock);
     
-    if(!conn_req_glb || conn_req_glb->is_routed == 1) {
-        pthread_mutex_unlock(&route_open_lock);
-        return 1; /* pretend its already there to prevent scanning */
+    if(conn_req_glb->is_routed == 1) {
+        pthread_mutex_unlock(&conn_req_lock);
+        return 1; // pretend its already there to prevent scanning
     }
 
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
@@ -2685,104 +2793,195 @@ int is_client_in_checked_list(int client_id) {
         }
     }
     
-    pthread_mutex_unlock(&route_open_lock);
+    pthread_mutex_unlock(&conn_req_lock);
+    return found;
+}
+*/
+
+int is_client_in_checked_list_by_idx(int client_id, int idx, int internal) {
+    int found = 0;
+    
+    if(client_id <= 0 || idx < 0)
+        return 0;
+        
+    if(internal != 1 && internal != 0)
+        return 0;
+        
+    if(!conn_req_glb)
+        return 0;
+    
+    if(!internal)
+        pthread_mutex_lock(&conn_req_lock);
+    
+    if(conn_req_glb[idx].is_routed == 1) {
+        if(!internal)
+            pthread_mutex_unlock(&conn_req_lock);
+        return 1; /* pretend its already there to prevent scanning */
+    }
+
+    for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
+        if(conn_req_glb[idx].client_id_arr[i] == client_id) {
+            found = 1;
+            break;
+        }
+    }
+    
+    if(!internal)
+        pthread_mutex_unlock(&conn_req_lock);
+    
     return found;
 }
 
 int mark_route_found(int client_id, int channel_id, int found) {
     int idx = -1;
+    int c_idx = -1;
     
     if(client_id <= 0 || channel_id <= 0 || found < 0)
         return 0;
         
-    pthread_mutex_lock(&route_open_lock);
-
-    if(!conn_req_glb) {
-        pthread_mutex_unlock(&route_open_lock);
+    if(!conn_req_glb)
+        return 0;
+        
+    pthread_mutex_lock(&conn_req_lock);
+    
+    for(int i = 0 ; i < MAX_CONCURRENT_CONN_OPEN ; i++) {
+        if(conn_req_glb[i].channel_id == channel_id) {
+            c_idx = i;
+            break;
+        }
+    }
+    
+    if(c_idx == -1) {
+        VR_LOG(LOG_ERROR, "Provided channel ID %d was not found", channel_id);
+        pthread_mutex_unlock(&conn_req_lock);
         return 0;
     }
     
     if(!found) {
-        for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
-            if(conn_req_glb->client_id_arr[i] == 0) {
-                idx = i;
+        for(int x = 0 ; x < MAX_CONCURRENT_CLIENTS ; x++) {
+            if(conn_req_glb[c_idx].client_id_arr[x] == 0) {
+                idx = x;
                 break;
             }
         }
 
         if(idx == -1) {
-            VR_LOG(LOG_ERROR, "No left space in conn_req_glb->client_id_arr...");
-            pthread_mutex_unlock(&route_open_lock);
+            VR_LOG(LOG_ERROR, "No left space in conn_req_glb[%d].client_id_arr...", c_idx);
+            pthread_mutex_unlock(&conn_req_lock);
             return 0;
         }
     
-        conn_req_glb->client_id_arr[idx] = client_id;
+        conn_req_glb[c_idx].client_id_arr[idx] = client_id;
         
-        pthread_mutex_unlock(&route_open_lock);
+        pthread_mutex_unlock(&conn_req_lock);
         return 1;
     }
     
-    if(conn_req_glb->channel_id != channel_id) {
-        VR_LOG(LOG_ERROR, "Channel ID does NOT coincide (client provided vs global reference)");
-        pthread_mutex_unlock(&route_open_lock);
-        return 0;
-    }
+    conn_req_glb[c_idx].is_routed = 1;
+    conn_req_glb[c_idx].client_id = client_id;
     
-    conn_req_glb->is_routed = 1;
-    conn_req_glb->client_id = client_id;
-    
-    pthread_mutex_unlock(&route_open_lock);
+    pthread_mutex_unlock(&conn_req_lock);
     return 1;
 }
 
-int is_route_discovery_in_process(void) {
+int is_route_solved(int channel_id) {
+    int idx = -1;
+    
+    if(channel_id < 0)
+        return 1; /* consider it as yes to skip errors */
+        
+    pthread_mutex_lock(&conn_req_lock);
+        
+    for(int i = 0 ; i < MAX_CONCURRENT_CONN_OPEN ; i++) {
+        if(conn_req_glb[i].channel_id == channel_id) {
+            idx = i;
+            break;
+        }
+    } 
 
-    pthread_mutex_lock(&route_open_lock);
-    
-    if(!conn_req_glb || conn_req_glb->is_routed == 1) {
-        pthread_mutex_unlock(&route_open_lock);
-        return 0;
+    if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Provided channel ID %d was not found", channel_id);
+        pthread_mutex_unlock(&conn_req_lock);
+        return 1; /* consider it as yes to skip errors */
     }
     
-    if(conn_req_glb->ip == 0 || conn_req_glb->port == 0) {
-        pthread_mutex_unlock(&route_open_lock);
-        return 0;
+    if(conn_req_glb[idx].is_routed == 1) {
+        pthread_mutex_unlock(&conn_req_lock);
+        return 1;
     }
     
-    pthread_mutex_unlock(&route_open_lock);
-    return 1; 
+    pthread_mutex_unlock(&conn_req_lock);
+        
+    return 0;
 }
 
-char *get_route_req_open_cmd(int client_id, size_t *out_size) {
+int is_route_discovery_in_process(int client_id) {
+    int idx = -1;
+    
+    if(client_id < 0)
+        return -1;
+    
+    if(!conn_req_glb)
+        return -1;
+    
+    pthread_mutex_lock(&conn_req_lock);
+    
+    for(int i = 0 ; i < MAX_CONCURRENT_CONN_OPEN ; i++) {
+        if(conn_req_glb[i].in_use == 1 && conn_req_glb[i].is_routed == 0
+               && conn_req_glb[i].ip != 0 && conn_req_glb[i].port != 0) {
+            
+            if(is_client_in_checked_list_by_idx(client_id, i, 1))
+                continue;
+                
+            idx = i;
+            break;
+        }
+    }
+    
+    if(idx == -1) {
+        pthread_mutex_unlock(&conn_req_lock);
+        return -1;
+    }
+    
+    pthread_mutex_unlock(&conn_req_lock);
+    
+    return idx; 
+}
+
+char *get_route_req_open_cmd(int idx, int client_id, size_t *out_size) {
     size_t osz = 0;
     char *p = NULL;
     tlv_header *tlv = NULL;
     conn_cmd *c_cmd = NULL;
-    int idx = -1;
+    int c_idx = -1;
     
-    if(client_id <= 0 || !out_size)
+    if(idx < 0 || client_id <= 0 || !out_size)
         return NULL;
     
     *out_size = 0;
     
-    pthread_mutex_lock(&route_open_lock);
+    if(!conn_req_glb)
+        return NULL;
     
-    if(!conn_req_glb || conn_req_glb->is_routed == 1) {
-        pthread_mutex_unlock(&route_open_lock);
+    pthread_mutex_lock(&conn_req_lock);
+    
+    if(conn_req_glb[idx].is_routed == 1) {
+        pthread_mutex_unlock(&conn_req_lock);
         return NULL;
     }
     
-    if(conn_req_glb->ip == 0 || conn_req_glb->port == 0) {
-        pthread_mutex_unlock(&route_open_lock);
+    if(conn_req_glb[idx].ip == 0 || conn_req_glb[idx].port == 0) {
+        pthread_mutex_unlock(&conn_req_lock);
         return NULL;
     }
     
     osz = sizeof(tlv_header) + sizeof(conn_cmd);
     p = calloc(osz, sizeof(char));
     if(!p) {
-        pthread_mutex_unlock(&route_open_lock);
+        pthread_mutex_unlock(&conn_req_lock);
         return NULL;
     }
+    
     tlv = (tlv_header *)p;
     c_cmd = (conn_cmd *)((char *)p + sizeof(tlv_header));
     
@@ -2791,30 +2990,128 @@ char *get_route_req_open_cmd(int client_id, size_t *out_size) {
     tlv->tlv_data_len = sizeof(conn_cmd);
     
     c_cmd->cmd = cmd_def_data[CHANNEL_OPEN_CMD].value;
-    c_cmd->channel_id = conn_req_glb->channel_id;
-    c_cmd->ip_addr = htonl(conn_req_glb->ip);
-    c_cmd->port = conn_req_glb->port;
+    c_cmd->channel_id = conn_req_glb[idx].channel_id;
+    c_cmd->ip_addr = htonl(conn_req_glb[idx].ip);
+    c_cmd->port = conn_req_glb[idx].port;
     
     for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++) {
-        if(conn_req_glb->client_id_arr[i] == 0) {
+        if(conn_req_glb[idx].client_id_arr[i] == 0) {
+            c_idx = i;
+            break;
+        }
+    }
+    
+    if(c_idx == -1) {
+        VR_LOG(LOG_ERROR, "No space left in conn_req_glb[%d].client_id_arr, MAX_CONCURRENT_CLIENTS reached", idx);
+        *out_size = 0;
+        pthread_mutex_unlock(&conn_req_lock);
+        return NULL;
+    }
+    
+    conn_req_glb[idx].client_id_arr[c_idx] = client_id;
+    
+    pthread_mutex_unlock(&conn_req_lock);
+    
+    *out_size = osz;
+    return p; 
+}
+
+int create_conn_req_entry(int channel_id, uint32_t ip_addr, uint16_t port) {
+    int idx = -1;
+    
+    if(channel_id <= 0 || ip_addr == 0 || port == 0) {
+        VR_LOG(LOG_ERROR, "Invalid values passed, this may lead to infinite loop...");
+        return -1;
+    }
+    
+    if(!conn_req_glb) {
+        VR_LOG(LOG_ERROR, "conn_req_glb is NULL, this may lead to infinite loop...");
+        return -1;
+    }
+    
+    pthread_mutex_lock(&conn_req_lock);
+    
+    for(int i = 0 ; i < MAX_CONCURRENT_CONN_OPEN ; i++) {
+        if(conn_req_glb && conn_req_glb[i].in_use == 0) {
             idx = i;
             break;
         }
     }
     
     if(idx == -1) {
-        VR_LOG(LOG_ERROR, "No space left in conn_req_glb->client_id_arr, MAX_CONCURRENT_CLIENTS reached");
-        *out_size = 0;
-        pthread_mutex_unlock(&route_open_lock);
-        return NULL;
+        VR_LOG(LOG_INFO, "Maximum simultaneous route discovery requests reached");
+        pthread_mutex_unlock(&conn_req_lock);
+        return -1;
+    }
+
+    conn_req_glb[idx].in_use = 1;
+    conn_req_glb[idx].is_routed = 0;
+    conn_req_glb[idx].channel_id = channel_id; /* temporal channel id for ref */
+    conn_req_glb[idx].client_id = 0;
+    conn_req_glb[idx].ip = ip_addr;
+    conn_req_glb[idx].port = port;
+    
+    for(int x = 0 ; x < MAX_CONCURRENT_CLIENTS ; x++)
+        conn_req_glb[idx].client_id_arr[x] = 0;
+    
+    pthread_mutex_unlock(&conn_req_lock);
+    
+    return idx;
+}
+
+/* XXX: locking relies on caller */
+int delete_conn_entry_by_id(int idx) {
+    if(idx < 0)
+        return 0;
+        
+    if(!conn_req_glb)
+        return 0;
+
+    conn_req_glb[idx].in_use = 0;
+    conn_req_glb[idx].is_routed = 0;
+    conn_req_glb[idx].channel_id = 0;
+    conn_req_glb[idx].client_id = 0;
+    conn_req_glb[idx].ip = 0;
+    conn_req_glb[idx].port = 0;
+    
+    for(int x = 0 ; x < MAX_CONCURRENT_CLIENTS ; x++)
+        conn_req_glb[idx].client_id_arr[x] = 0;
+        
+    return 1;
+}
+
+int delete_conn_entry(int channel_id) {
+    int idx = -1;
+    
+    if(channel_id <= 0)
+        return 0;
+        
+    if(!conn_req_glb)
+        return 0;
+        
+    pthread_mutex_lock(&conn_req_lock);
+       
+    for(int i = 0 ; i < MAX_CONCURRENT_CONN_OPEN ; i++) {
+        if(conn_req_glb && conn_req_glb[i].channel_id == 0) {
+            idx = i;
+            break;
+        }
     }
     
-    conn_req_glb->client_id_arr[idx] = client_id;
+    if(idx == -1) {
+        VR_LOG(LOG_ERROR, "Entry for channel ID '%d' was not found in connection open request defs...", channel_id);
+        pthread_mutex_unlock(&conn_req_lock);
+        return 0;
+    }
     
-    pthread_mutex_unlock(&route_open_lock);
+    if(!delete_conn_entry_by_id(idx)) {
+        pthread_mutex_unlock(&conn_req_lock);
+        return 0;
+    }
+        
+    pthread_mutex_unlock(&conn_req_lock);
     
-    *out_size = osz;
-    return p; 
+    return 1;
 }
 
 int issue_connection_open(int proxy_sock, uint32_t ip_addr, uint16_t port) {
@@ -2827,64 +3124,52 @@ int issue_connection_open(int proxy_sock, uint32_t ip_addr, uint16_t port) {
     time_t route_req_init_time = 0;
     time_t curr_time = 0;
     struct in_addr i_addr;
+    int idx = -1;
     
-    pthread_mutex_lock(&iopen_lock);
-    
-    if(conn_req_glb) {
-        VR_LOG(LOG_WARN, "conn_req_glb is not NULL and it should be...");
-        free(conn_req_glb);
-        conn_req_glb = NULL;
-    }
-    
-    VR_LOG(LOG_DEBUG, "Allocating conn_req_glb instance...");
-    
-    conn_req_glb = (conn_open_req *)calloc(1, sizeof(conn_open_req));
-    if(!conn_req_glb) {
-        err = 1;
-        goto end;
-    }
+    if(ip_addr == 0 || port == 0)
+        return 0;
     
     channel_id = generate_channel_id();
     
-    VR_LOG(LOG_DEBUG, "Generated temporary channel_id: %ld", channel_id);
-    
-    conn_req_glb->is_routed = 0;
-    conn_req_glb->client_id = 0;
-    conn_req_glb->channel_id = channel_id; /* temporary channel_id */
-    conn_req_glb->ip = ip_addr;
-    conn_req_glb->port = port;
-    
-    for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++)
-        conn_req_glb->client_id_arr[i] = 0;
+    idx = -1;
+    while(idx == -1) {
+        idx = create_conn_req_entry(channel_id, ip_addr, port);
+        sleep(1);
+    }
     
     route_req_init_time = time(NULL);
     
-    VR_LOG(LOG_DEBUG, "Starting connection open request main loop...");
+    VR_LOG(LOG_DEBUG, "Starting connection open request main loop (id=%d)...", idx);
     
     while(1) {
         curr_time = time(NULL);
         
-        VR_LOG(LOG_DEBUG, "New loop iter for route discovery...");
+        VR_LOG(LOG_INFO, "Applying algorithm for route discovery (id=%d)...", idx);
         
         if((curr_time - route_req_init_time) >= ROUTE_REQUEST_PROCESS_TIMEOUT) {
-            VR_LOG(LOG_INFO, "Timed out tring to open a new connection...");
+            VR_LOG(LOG_INFO, "Timed out tring to open a new connection (id=%d)...", idx);
             success = 0;
             break;
         }
         
-        pthread_mutex_lock(&route_open_lock);
-        
-        if(conn_req_glb->is_routed && conn_req_glb->client_id != 0) {
-            VR_LOG(LOG_DEBUG, "Discovery process finished, route discovered successfully...");
+        if(conn_req_glb[idx].is_routed && conn_req_glb[idx].client_id != 0) {
+            VR_LOG(LOG_INFO, "Discovery process finished, route discovered successfully (idx=%d)...", idx);
             success = 1;
-            client_id = conn_req_glb->client_id;
-            pthread_mutex_unlock(&route_open_lock);
+            client_id = conn_req_glb[idx].client_id;
+            
+            pthread_mutex_lock(&conn_req_lock);
+            
+            if(!delete_conn_entry_by_id(idx)) {
+                VR_LOG(LOG_ERROR, "Could not remove connection open request global def entry...");
+                success = 0;
+            }
+            
+            pthread_mutex_unlock(&conn_req_lock);
+            
             break;
         }
         
-        pthread_mutex_unlock(&route_open_lock);
-        
-        sleep(2);
+        sleep(1);
     }
     
     if(!success) {
@@ -2913,24 +3198,7 @@ int issue_connection_open(int proxy_sock, uint32_t ip_addr, uint16_t port) {
 end:
     if(err)
         channel_id = 0;
-    
-    if(conn_req_glb) {
-        conn_req_glb->is_routed = 0;
-        conn_req_glb->client_id = 0;
-        conn_req_glb->channel_id = 0;
-        conn_req_glb->ip = 0;
-        conn_req_glb->port = 0;
-    
-        for(int i = 0 ; i < MAX_CONCURRENT_CLIENTS ; i++)
-            conn_req_glb->client_id_arr[i] = 0;
-    }
-        
-    if(conn_req_glb) {
-        free(conn_req_glb);
-        conn_req_glb = NULL;
-    }
-        
-    pthread_mutex_unlock(&iopen_lock);
+
     return channel_id;
 }
 
@@ -2953,6 +3221,7 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
     size_t enc_sz = 0;
     char *qdata = NULL;
     size_t qsize = 0;
+    int ref_idx = -1;
     req_t req_type = UNKNOWN_REQUEST_TYPE;
    
     if(!data || data_sz == 0 || !out_size)
@@ -3038,9 +3307,11 @@ char *interpret_http_req(char *data, size_t data_sz, size_t *out_size) {
             // TODO: should we add more locking here to ensure concurrency issues on multiple clients at once?
             VR_LOG(LOG_DEBUG, "Data requested by client...");
             
-            if(is_route_discovery_in_process() && !is_client_in_checked_list(cid)) {
+            ref_idx = is_route_discovery_in_process(cid);
+
+            if(ref_idx >= 0) { // if(!is_client_in_checked_list_by_idx(cid, ref_idx, 0))
                 VR_LOG(LOG_DEBUG, "There is a discovery process currently. Testing this node as a possible route...");
-                qdata = get_route_req_open_cmd(cid, &qsize);    
+                qdata = get_route_req_open_cmd(ref_idx, cid, &qsize);    
             } else {
                 VR_LOG(LOG_DEBUG, "Trying to retrieve queued data...");
                 qdata = get_next_queued_data(cid, &qsize);
@@ -3266,7 +3537,6 @@ int relay_http_srv_handle_req(rl_arg_pass *arg) {
                      "Content-Type: text/html; charset=ISO-8859-1\r\n"
                      "X-XSS-Protection: 0\r\n"
                      "X-Frame-Options: SAMEORIGIN\r\n"
-      		     "Transfer-Encoding: chunked\r\n"
       		     "Set-Cookie: session=jnd82Nsb2VFDJdn25sAlF6sdD47wv\r\n"
       		     "Content-Length: 78\r\n"
       		     "\r\n%s", "<!DOCTYPE html><html><head><title>blank</title></head><body><h1>blank page</h1></body></html>");
@@ -4271,6 +4541,16 @@ int start_socks4_rev_proxy(char *proxy_host, int proxy_port, char *relay_host, i
             goto end;
         }
     }
+    
+    VR_LOG(LOG_DEBUG, "Allocating and initializing conn_req_glb...");
+    
+    if(!conn_req_glb) {
+        conn_req_glb = (conn_open_req *)calloc(MAX_CONCURRENT_CONN_OPEN, sizeof(conn_open_req));
+        if(!conn_req_glb) {
+            fail = OUT_OF_MEMORY_ERROR;
+            goto end;
+        }
+    }
   
     if(proto == HTTP_COM_PROTO)
         VR_LOG(LOG_INFO, "Using protocol: HTTP_COM_PROTO");
@@ -4338,6 +4618,11 @@ end:
     
     VR_LOG(LOG_DEBUG, "Closing all relay clients...");
     close_all_clients();
+    
+    if(conn_req_glb) {
+        free(conn_req_glb);
+        conn_req_glb = NULL;
+    }
   
     if(proxy_client_conns) {
         free(proxy_client_conns);
@@ -4348,6 +4633,11 @@ end:
         free(client_conns);
         client_conns = NULL;
     }
+    
+    if(handshake_defs) {
+        free(handshake_defs);
+        handshake_defs = NULL;
+    }
   
     if(_key) {
         free(_key);
@@ -4355,6 +4645,12 @@ end:
     }
   
     return (fail == 0);
+}
+
+void socks4_rev_close_srv(void) {
+    close_srv = 1;
+    sleep(4);
+    return;
 }
 
 char *socks4_rev_strerror(int err) {

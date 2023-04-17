@@ -28,6 +28,7 @@
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
 
+#define MAX_CONCURRENT_CONN_OPEN 512
 #define MAX_CONCURRENT_PROXY_CLIENTS 1024
 #define MAX_CONCURRENT_CLIENTS 1024
 #define MAX_CONCURRENT_CHANNELS_PER_CLIENT 2048
@@ -155,6 +156,7 @@ typedef struct _cmd_def {
 } cmd_def;
 
 typedef struct _conn_open_req {
+    int in_use;
     int is_routed;
     int channel_id;
     int client_id;
@@ -229,8 +231,9 @@ char *get_data_from_http(char *data, size_t data_sz, size_t *out_size);
 char *get_http_data_response(char *data, size_t data_sz, size_t *out_size);
 int is_client_in_checked_list(int client_id);
 int mark_route_found(int client_id, int channel_id, int found);
-int is_route_discovery_in_process(void);
-char *get_route_req_open_cmd(int client_id, size_t *out_size);
+int is_route_discovery_in_process(int client_id);
+int is_route_solved(int channel_id);
+char *get_route_req_open_cmd(int idx, int client_id, size_t *out_size);
 int issue_connection_open(int proxy_sock, uint32_t ip_addr, uint16_t port);
 char *interpret_http_req(char *data, size_t data_sz, size_t *out_size);
 int relay_http_srv_handle_req(rl_arg_pass *arg);
