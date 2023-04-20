@@ -3156,21 +3156,20 @@ int issue_connection_open(int proxy_sock, uint32_t ip_addr, uint16_t port) {
             VR_LOG(LOG_INFO, "Discovery process finished, route discovered successfully (idx=%d)...", idx);
             success = 1;
             client_id = conn_req_glb[idx].client_id;
-            
-            pthread_mutex_lock(&conn_req_lock);
-            
-            if(!delete_conn_entry_by_id(idx)) {
-                VR_LOG(LOG_ERROR, "Could not remove connection open request global def entry...");
-                success = 0;
-            }
-            
-            pthread_mutex_unlock(&conn_req_lock);
-            
             break;
         }
         
         sleep(1);
     }
+    
+    pthread_mutex_lock(&conn_req_lock);
+            
+    if(!delete_conn_entry_by_id(idx)) {
+        VR_LOG(LOG_ERROR, "Could not remove connection open request global def entry...");
+        success = 0;
+    }
+            
+    pthread_mutex_unlock(&conn_req_lock);
     
     if(!success) {
         err = 1;
