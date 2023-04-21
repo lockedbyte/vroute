@@ -14,6 +14,12 @@ Supports the following protocols for relay communication:
 
 - HTTPS
 
+Supported operating systems:
+
+- GNU/Linux
+
+- Microsoft Windows
+
 This project has two main parts:
 
 - **Server**: Binds a SOCKS proxy and a relay server
