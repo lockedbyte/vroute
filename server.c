@@ -139,6 +139,8 @@ And then pass the path to cert.pem to the server initialization entrypoing
 #define MAX_LOG_MESSAGE_SIZE 4096
 #define LOG_PREFIX_STR "[VROUTE]"
 
+#define UNLIMITED_OPPORTUNITIES 1
+
 /*
 
 Source: https://www.openssh.com/txt/socks4.protocol
@@ -2390,7 +2392,7 @@ ssize_t http_read_all(int sock, SSL *c_ssl, char **data, size_t *data_sz, int is
     char *ptr = NULL;
     int sock_m = -1;
     int tries = 0;
-    int max_tries = 4;
+    int max_tries = 20;
 
     if(sock < 0 || !data || !data_sz)
         return -1;
