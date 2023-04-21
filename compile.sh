@@ -7,7 +7,7 @@ elif [[ "$1" == "release" ]]; then
 elif [[ "$1" == "dev" ]]; then
     BUILD_FLAG="BUILD_DEV=1"
 else
-    echo "Error: First argument must be 'debug', 'release' or 'dev'"
+    echo "Error: First argument must be 'debug', 'release', 'dev'"
     exit 1
 fi
 
@@ -19,3 +19,5 @@ if [[ "$1" == "release" ]]; then
     strip libvroute_client.so
     strip libvroute_server.so
 fi
+
+
