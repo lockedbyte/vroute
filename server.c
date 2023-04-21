@@ -4695,7 +4695,7 @@ int main(int argc, char *argv[]) {
     proto_t protocol = 0;
     int err = 0;
     
-    if(argc != 7) {
+    if(argc < 7) {
         usage();
         return 0;
     }
