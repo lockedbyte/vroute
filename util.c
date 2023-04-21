@@ -7,9 +7,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
 #include <time.h>
 #include <ctype.h>
+
+#ifndef WINDOWS_OS
+#include <sys/ioctl.h>
+#else
+#include <windows.h>
+#include <winsock2.h>
+
+#pragma comment(lib, "ws2_32.lib")
+
+#endif
 
 #include "util.h"
 
@@ -94,7 +103,7 @@ ssize_t write_all(int sock, char **data, size_t *data_sz) {
         curr = time(NULL);
         if((curr - start) >= CONN_TIMEOUT)
             return -1;
-        r = write(sock, ptr, sz - sent);
+        r = send(sock, ptr, sz - sent, 0);
         if(r < 0)
            return -1;
         sent += r;
@@ -104,13 +113,17 @@ ssize_t write_all(int sock, char **data, size_t *data_sz) {
 }
 
 ssize_t read_all(int sock, char **data, size_t *data_sz) {
+    #if WINDOWS_OS
+    long bytes_available = 0;
+    #else
     int bytes_available = 0;
+    #endif
     size_t sent = 0;
     int r = 0;
     char *ptr = NULL;
     time_t start = time(NULL);
     time_t curr = 0;
-    
+
     if(sock < 0 || !data || !data_sz)
         return -1;
 
@@ -139,7 +152,7 @@ ssize_t read_all(int sock, char **data, size_t *data_sz) {
         curr = time(NULL);
         if((curr - start) >= CONN_TIMEOUT)
             return -1;
-        r = read(sock, ptr, bytes_available - sent);
+        r = recv(sock, ptr, bytes_available - sent, 0);
         if(r < 0)
             return -1;
         sent += r;
