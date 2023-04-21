@@ -15,11 +15,6 @@
 #include <errno.h>
 #include <ctype.h>
 #include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/uio.h>
-#include <sys/time.h>
 
 #include "base64.h"
 
