@@ -6,6 +6,14 @@ Reverse SOCKS proxy through HTTP(S) for network pivoting
 
 Project allowing operators to use compromised devices in offensive network operations to route traffic into private network for which there is no direct access otherwise.
 
+Supports the following protocols for relay communication:
+
+- TCP
+
+- HTTP
+
+- HTTPS
+
 This project has two main parts:
 
 - **Server**: Binds a SOCKS proxy and a relay server
@@ -17,6 +25,12 @@ The SOCKS proxy is where we poing the SOCKS proxy client (Eg.: using proxychains
 The relay server acts as a middleman between compromised devices and the SOCKS proxy client, which ultimately allows the SOCKS proxy client to reach network destinations that the compromised nodes have access to.
 
 Compiles ELF and DLL shared libraries to be plugged in your implants for easy use of the client in memory without touching disk (Eg.: check [https://github.com/lockedbyte/so_loader](https://github.com/lockedbyte/so_loader)).
+
+VROUTE uses a handshake to verify a PSK (password) to be able to connect to the server.
+
+The communication is encrypted in AES-CBC 256-bit.
+
+**NOTE:** Still fixing bugs in the HTTPS implementation for Windows clients, use HTTP or TCP instead until fixed.
 
 ## Installing
 
